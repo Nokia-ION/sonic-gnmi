@@ -1,0 +1,30 @@
+{
+  "title": "openconfig-interfaces Ethernet0 MTU set->get round trip",
+  "operations": [
+    {
+      "operation": "update",
+      "returnCode": 0,
+      "xpath": "/openconfig-interfaces:interfaces/interface[name=Ethernet0]/config",
+      "target": "OC_YANG",
+      "attributeData": "{\"openconfig-interfaces:config\":{\"mtu\":9003}}"
+    },
+    {
+      "operation": "get",
+      "returnCode": 0,
+      "xpath": "/openconfig-interfaces:interfaces/interface[name=Ethernet0]/config/mtu",
+      "target": "OC_YANG",
+      "type": "object",
+      "required": [
+        "openconfig-interfaces:mtu"
+      ],
+      "properties": {
+        "openconfig-interfaces:mtu": {
+          "type": "integer",
+          "enum": [
+            9003
+          ]
+        }
+      }
+    }
+  ]
+}
