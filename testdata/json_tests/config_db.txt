@@ -1,0 +1,10 @@
+{
+  "PORT|Ethernet0": {
+    "alias": "Eth0",
+    "index": "0",
+    "lanes": "0,1,2,3",
+    "speed": "100000",
+    "mtu": "9100",
+    "admin_status": "up"
+  }
+}
