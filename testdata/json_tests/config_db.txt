@@ -6,5 +6,11 @@
     "speed": "100000",
     "mtu": "9100",
     "admin_status": "up"
+  },
+  "PORTCHANNEL|PortChannel1": {
+    "admin_status": "up",
+    "mtu": "9100",
+    "lacp_key": "auto",
+    "min_links": "1"
   }
 }
