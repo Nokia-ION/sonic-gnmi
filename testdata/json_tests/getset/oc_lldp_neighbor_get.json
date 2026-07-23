@@ -1,0 +1,74 @@
+{
+  "title": "openconfig-lldp Ethernet0 neighbor get (APPL_DB LLDP_ENTRY_TABLE seeded)",
+  "operations": [
+    {
+      "operation": "get",
+      "returnCode": 0,
+      "xpath": "/openconfig-lldp:lldp/interfaces/interface[name=Ethernet0]/config/enabled",
+      "target": "OC_YANG",
+      "type": "object",
+      "required": [
+        "openconfig-lldp:enabled"
+      ],
+      "properties": {
+        "openconfig-lldp:enabled": {
+          "type": "boolean"
+        }
+      },
+      "subOpers": [
+        {
+          "oper": "dbHSet",
+          "title": "seed APPL_DB LLDP_ENTRY_TABLE:Ethernet0 with a fake neighbor",
+          "db": "APPL_DB",
+          "value": {
+            "LLDP_ENTRY_TABLE:Ethernet0": {
+              "lldp_rem_sys_name": "peer-switch-01",
+              "lldp_rem_chassis_id": "aa:bb:cc:dd:ee:ff",
+              "lldp_rem_port_id": "Ethernet42",
+              "lldp_rem_port_desc": "uplink to spine",
+              "lldp_rem_sys_desc": "SONiC peer node",
+              "lldp_rem_index": "1",
+              "lldp_rem_time_mark": "120"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "operation": "get",
+      "returnCode": 0,
+      "xpath": "/openconfig-lldp:lldp/interfaces/interface[name=Ethernet0]/neighbors/neighbor[id=Ethernet0]/state/system-name",
+      "target": "OC_YANG",
+      "type": "object",
+      "required": [
+        "openconfig-lldp:system-name"
+      ],
+      "properties": {
+        "openconfig-lldp:system-name": {
+          "type": "string",
+          "enum": [
+            "peer-switch-01"
+          ]
+        }
+      }
+    },
+    {
+      "operation": "get",
+      "returnCode": 0,
+      "xpath": "/openconfig-lldp:lldp/interfaces/interface[name=Ethernet0]/neighbors/neighbor[id=Ethernet0]/state/chassis-id",
+      "target": "OC_YANG",
+      "type": "object",
+      "required": [
+        "openconfig-lldp:chassis-id"
+      ],
+      "properties": {
+        "openconfig-lldp:chassis-id": {
+          "type": "string",
+          "enum": [
+            "aa:bb:cc:dd:ee:ff"
+          ]
+        }
+      }
+    }
+  ]
+}

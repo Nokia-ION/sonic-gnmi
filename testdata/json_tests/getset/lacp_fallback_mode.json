@@ -1,0 +1,70 @@
+{
+  "title": "Lacp_fallback_mode (borrowed from UMF, adapted for CPN)",
+  "_comment": [
+    "Borrowed from UMF testdata/json_tests/getset/lacp_fallback_mode.json.",
+    "Adaptations required to run on CPN off-box:",
+    "  1. xpaths rewritten from the UMF 'openconfig/lacp/...' origin style to the",
+    "     CPN module-qualified '/openconfig-lacp:lacp/...' style.",
+    "  2. CONFIG_DB PORTCHANNEL|PortChannel1 is seeded via config_db.txt -- the CPN",
+    "     lacp transformer requires the PortChannel to exist to answer any query.",
+    "  3. Operational STATE_DB LAG_TABLE|PortChannel1 is seeded here (teamd creates",
+    "     it on a live switch) so the state-fallback read resolves off-box.",
+    "The UMF write operations (update .../config/fallback) are omitted: on CPN the",
+    "lacp subtree transformer returns the write only via updateSubOpDataMap, and the",
+    "CPN write path (xlate_to_db verifyParentTblExists) rejects the empty primary",
+    "result with 'Resource not found'. That is a CPN translib write-path difference,",
+    "not a test issue; the read/default-value behaviour below passes on CPN."
+  ],
+  "operations": [
+    {
+      "title": "Return bool default value when fallback is not in database. Cover config leaf path case",
+      "operation": "get",
+      "returnCode": 0,
+      "xpath": "/openconfig-lacp:lacp/interfaces/interface[name=PortChannel1]/config/fallback",
+      "target": "OC_YANG",
+      "type": "object",
+      "required": [
+        "openconfig-lacp:fallback"
+      ],
+      "properties": {
+        "openconfig-lacp:fallback": {
+          "type": "boolean",
+          "enum": [
+            false
+          ]
+        }
+      },
+      "subOpers": [
+        {
+          "oper": "dbHSet",
+          "title": "seed operational STATE_DB LAG_TABLE:PortChannel1 (teamd would create this on a switch)",
+          "db": "STATE_DB",
+          "value": {
+            "LAG_TABLE|PortChannel1": {
+              "oper_status": "up"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Return bool default value when fallback is not in database. Cover state leaf path case",
+      "operation": "get",
+      "returnCode": 0,
+      "xpath": "/openconfig-lacp:lacp/interfaces/interface[name=PortChannel1]/state/fallback",
+      "target": "OC_YANG",
+      "type": "object",
+      "required": [
+        "openconfig-lacp:fallback"
+      ],
+      "properties": {
+        "openconfig-lacp:fallback": {
+          "type": "boolean",
+          "enum": [
+            false
+          ]
+        }
+      }
+    }
+  ]
+}
