@@ -308,6 +308,7 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 	cfg.SrvKeyLnk = *telemetryCfg.ServerKeyLnk
 	cfg.SrvKeyFile = *telemetryCfg.ServerKey
 	cfg.CertCRLConfig = *telemetryCfg.CertCRLConfig
+	cfg.AllowNoClientCert = *telemetryCfg.AllowNoClientCert
 	cfg.IntManFile = *telemetryCfg.IntManFile
 	cfg.CertzMetaFile = *telemetryCfg.CertzMetaFile
 
@@ -336,8 +337,17 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 	if cfg.SrvKeyFile != "" && cfg.SrvKeyLnk == "/keys/server_key.lnk" {
 		cfg.SrvKeyLnk = filepath.Join(filepath.Dir(cfg.SrvKeyFile), "server_key.lnk")
 	}
-	if cfg.CertzMetaFile == "" {
-		cfg.CertzMetaFile = "/keys/grpc-version.json"
+	// Mirror the *.lnk derivation for the Certz profile metadata file: keep it
+	// alongside the configured certificates (e.g. /etc/sonic/telemetry) rather
+	// than the /keys default, so it lands in the same (writable) cert directory
+	// without an explicit --grpc_meta flag from the launch script. This matches
+	// how the symlink paths are derived above and how UMF derives them in Go.
+	if cfg.CertzMetaFile == "" || cfg.CertzMetaFile == "/keys/grpc-version.json" {
+		if cfg.SrvCertFile != "" {
+			cfg.CertzMetaFile = filepath.Join(filepath.Dir(cfg.SrvCertFile), "grpc-version.json")
+		} else if cfg.CertzMetaFile == "" {
+			cfg.CertzMetaFile = "/keys/grpc-version.json"
+		}
 	}
 	if !*telemetryCfg.Insecure {
 		cfg.GetOptions = gnmi.SrvAdvConfig
@@ -486,84 +496,83 @@ func startGNMIServer(telemetryCfg *TelemetryConfig, cfg *gnmi.Config, serverCont
 		atomic.StoreInt32(&certLoaded, 0) // Not loaded
 
 		if !*telemetryCfg.NoTLS {
-			var certificate tls.Certificate
-			var err error
 			if *telemetryCfg.Insecure {
-				certificate, err = testcert.NewCert()
+				// Test-only: self-signed certificate served through a static
+				// TLS config (no rotation).
+				certificate, err := testcert.NewCert()
 				if err != nil {
 					log.Errorf("could not load server key pair: %s", err)
 					return
 				}
+
+				tlsCfg := &tls.Config{
+					ClientAuth:               tls.RequireAndVerifyClientCert,
+					Certificates:             []tls.Certificate{certificate},
+					MinVersion:               tls.VersionTLS12,
+					SessionTicketsDisabled:   true,
+					CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
+					PreferServerCipherSuites: true,
+					CipherSuites: []uint16{
+						tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+						tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+						tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+						tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+						tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+						tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					},
+				}
+
+				if *telemetryCfg.AllowNoClientCert {
+					// RequestClientCert will ask client for a certificate but
+					// won't require it to proceed. If certificate is provided,
+					// it will be verified.
+					tlsCfg.ClientAuth = tls.RequestClientCert
+				}
+
+				if *telemetryCfg.CaCert != "" {
+					ca, err := ioutil.ReadFile(*telemetryCfg.CaCert)
+					if err != nil {
+						log.Errorf("could not read CA certificate: %s", err)
+					}
+					certPool := x509.NewCertPool()
+					if ok := certPool.AppendCertsFromPEM(ca); !ok {
+						log.Errorf("failed to append CA certificate")
+					}
+					tlsCfg.ClientCAs = certPool
+				}
+
+				tlsOpts = []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
 			} else {
-				watcher, err := fsnotify.NewWatcher()
+				// Secure path: serve TLS through advancedtls per-connection
+				// callbacks (cfg.GetOptions == SrvAdvConfig) that re-read the
+				// cert/key/CA symlinks on every new handshake. This makes gNSI
+				// Certz rotation hitless: Certz.Rotate flips the symlink and the
+				// next connection is served the new certificate with no restart.
+				// SrvAdvConfig also bootstraps the symlinks from the configured
+				// cert/key/CA on first start.
+				opts, _, err := cfg.GetOptions(cfg)
 				if err != nil {
-					log.Errorf("Received error when creating fsnotify watcher %v", err)
-				}
-				if watcher != nil {
-					go iNotifyCertMonitoring(watcher, telemetryCfg, serverControlSignal, nil, &certLoaded)
-				}
-				certificate, err = tls.LoadX509KeyPair(*telemetryCfg.ServerCert, *telemetryCfg.ServerKey)
-				if err != nil {
-					computeSHA512Checksum(*telemetryCfg.ServerCert)
-					computeSHA512Checksum(*telemetryCfg.ServerKey)
-					log.Errorf("could not load server key pair: %s", err)
+					log.Errorf("could not set up server TLS credentials: %s", err)
+					// Defensive: production provisions certs before start. If the
+					// material is not present yet, wait for it to appear and retry
+					// instead of crash-looping.
+					if watcher, werr := fsnotify.NewWatcher(); werr == nil {
+						go iNotifyCertMonitoring(watcher, telemetryCfg, serverControlSignal, nil, &certLoaded)
+					} else {
+						log.Errorf("Received error when creating fsnotify watcher %v", werr)
+					}
 					for {
 						serverControlValue := <-serverControlSignal
 						if serverControlValue == ServerStop {
 							return // server called to shutdown
 						}
 						if serverControlValue == ServerStart {
-							break // retry loading certs after cert has been written or created
-						}
-						// We don't care if file is deleted here as we will only want to check
-						// if certs have been created or written to, else we will wait again
-					}
-					continue
-				}
-			}
-
-			tlsCfg := &tls.Config{
-				ClientAuth:               tlsClientAuthPolicy(*telemetryCfg.AllowNoClientCert),
-				Certificates:             []tls.Certificate{certificate},
-				MinVersion:               tls.VersionTLS12,
-				SessionTicketsDisabled:   true,
-				CurvePreferences:         []tls.CurveID{tls.CurveP521, tls.CurveP384, tls.CurveP256},
-				PreferServerCipherSuites: true,
-				CipherSuites: []uint16{
-					tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-					tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-					tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				},
-			}
-
-			if *telemetryCfg.CaCert != "" {
-				caCertLoaded := true
-				ca, err := ioutil.ReadFile(*telemetryCfg.CaCert)
-				if err != nil {
-					log.Errorf("could not read CA certificate: %s", err)
-					caCertLoaded = false
-				}
-				certPool := x509.NewCertPool()
-				if ok := certPool.AppendCertsFromPEM(ca); !ok {
-					log.Errorf("failed to append CA certificate")
-					caCertLoaded = false
-				}
-				if !caCertLoaded {
-					for {
-						serverControlValue := <-serverControlSignal
-						if serverControlValue == ServerStop {
-							return // server called to shutdown
-						}
-						if serverControlValue == ServerStart {
-							break // retry loading certs after cert has been written or created
+							break // retry after cert material appears
 						}
 					}
 					continue
 				}
-				tlsCfg.ClientCAs = certPool
+				tlsOpts = opts
 			}
 
 			atomic.StoreInt32(&certLoaded, 1) // Certs have loaded
@@ -582,8 +591,6 @@ func startGNMIServer(telemetryCfg *TelemetryConfig, cfg *gnmi.Config, serverCont
 				PermitWithoutStream: true,             // Allow pings when there are no active streams
 			}
 			commonOpts = append(commonOpts, grpc.KeepaliveEnforcementPolicy(keep_alive_policy))
-
-			tlsOpts = []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
 
 			if *telemetryCfg.IdleConnDuration > 0 { // non inf case
 				commonOpts = append(commonOpts, grpc.KeepaliveParams(keep_alive_params))
