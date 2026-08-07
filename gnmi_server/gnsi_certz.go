@@ -921,6 +921,37 @@ func isSymlinkValid(path string) bool {
 	return true
 }
 
+// symlinkPointsToRotation reports whether link is a symlink that currently
+// resolves to a gNSI Certz-rotated artifact and whose target still exists.
+// Certz names rotated files with the fixed suffixes produced in Rotate:
+// "<profile>_<ver>_<ts>_cert.pem", "..._key.pem" and "ca_..._bundle.pem".
+//
+// A true result means a rotation is in effect and the link must be preserved
+// across a server (re)start so a rotated certificate survives restarts. Any
+// other state -- a missing/dangling link, or a link pointing at a
+// config-provisioned certificate -- returns false, so the caller (re)links to
+// the configured material. This makes a changed config cert take effect on the
+// next start and lets stale non-rotation links self-heal, while never clobbering
+// an active rotation.
+func symlinkPointsToRotation(link string) bool {
+	// NOTE: muPath has to be writer-locked when entering this function.
+	target, err := os.Readlink(link)
+	if err != nil {
+		return false // not a symlink, or does not exist
+	}
+	base := filepath.Base(target)
+	if !strings.HasSuffix(base, "_cert.pem") &&
+		!strings.HasSuffix(base, "_key.pem") &&
+		!strings.HasSuffix(base, "_bundle.pem") {
+		return false
+	}
+	// Preserve only if the rotated target still exists (not dangling).
+	if _, err := os.Stat(link); err != nil {
+		return false
+	}
+	return true
+}
+
 // atomicSetSrvCertKeyPair atomically replaces server's private key and certificate.
 func atomicSetSrvCertKeyPair(cfg *Config, sCert, sKey string) error {
 	// NOTE: muPath has to be writer-locked when entering this function.
