@@ -7705,7 +7705,10 @@ func TestSrvAdvConfig(t *testing.T) {
 			expectCRLProvider: true,
 		},
 		{
-			name: "Invalid CRL Directory",
+			// A missing CRL directory is tolerated: the TLS-layer CRL provider
+			// is skipped and the server still starts (revocation is enforced at
+			// the application layer).
+			name: "Missing CRL Directory (tolerated)",
 			cfg: &Config{
 				CaCertFile:    caFile,
 				SrvCertFile:   srvCertFile,
@@ -7715,7 +7718,29 @@ func TestSrvAdvConfig(t *testing.T) {
 				SrvKeyLnk:     filepath.Join(tempDir, "srv_key.lnk"),
 				CertCRLConfig: filepath.Join(tempDir, "nonexistent_crl_dir"),
 			},
-			expectErr: true,
+			expectErr:         false,
+			expectClientCert:  true,
+			expectVerifyType:  advancedtls.CertVerification,
+			expectCRLProvider: false,
+		},
+		{
+			// With a CA configured but AllowNoClientCert set (client_auth=false
+			// / --allow_no_client_auth, e.g. streaming telemetry), the client
+			// certificate is requested but not required. A cert, if presented,
+			// is still verified (CertVerification).
+			name: "Valid Config with AllowNoClientCert",
+			cfg: &Config{
+				CaCertFile:        caFile,
+				SrvCertFile:       srvCertFile,
+				SrvKeyFile:        srvKeyFile,
+				CaCertLnk:         filepath.Join(tempDir, "ca.lnk"),
+				SrvCertLnk:        filepath.Join(tempDir, "srv_cert.lnk"),
+				SrvKeyLnk:         filepath.Join(tempDir, "srv_key.lnk"),
+				AllowNoClientCert: true,
+			},
+			expectErr:        false,
+			expectClientCert: false,
+			expectVerifyType: advancedtls.CertVerification,
 		},
 	}
 
@@ -7726,8 +7751,9 @@ func TestSrvAdvConfig(t *testing.T) {
 			os.Remove(tt.cfg.SrvCertLnk)
 			os.Remove(tt.cfg.SrvKeyLnk)
 
-			// Create the CRL directory if needed for the test case
-			if tt.cfg.CertCRLConfig != "" && !tt.expectErr {
+			// Create the CRL directory only when the provider is expected; the
+			// "missing directory" case intentionally leaves it absent.
+			if tt.cfg.CertCRLConfig != "" && tt.expectCRLProvider {
 				crlDir := filepath.Join(tt.cfg.CertCRLConfig, "crl")
 				if err := os.MkdirAll(crlDir, 0755); err != nil {
 					t.Fatalf("Failed to create CRL directory: %v", err)
@@ -7763,6 +7789,121 @@ func TestSrvAdvConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSrvAdvConfigRelinkPolicy verifies the startup (re)link policy in
+// SrvAdvConfig: a configured cert takes effect over a stale non-rotation
+// symlink, while an in-effect gNSI Certz rotation is preserved across a
+// (re)start.
+func TestSrvAdvConfigRelinkPolicy(t *testing.T) {
+	tempDir := createTempDir(t)
+
+	// Configured (current) server cert/key/CA files.
+	srvCert := filepath.Join(tempDir, "gnmiserver.crt")
+	srvKey := filepath.Join(tempDir, "gnmiserver.key")
+	caFile := filepath.Join(tempDir, "gnmiCA.pem")
+	for _, f := range []string{srvCert, srvKey, caFile} {
+		if err := os.WriteFile(f, []byte("dummy"), 0644); err != nil {
+			t.Fatalf("write %s: %v", f, err)
+		}
+	}
+
+	caLnk := filepath.Join(tempDir, "ca_cert.lnk")
+	srvCertLnk := filepath.Join(tempDir, "server_cert.lnk")
+	srvKeyLnk := filepath.Join(tempDir, "server_key.lnk")
+
+	newCfg := func() *Config {
+		return &Config{
+			CaCertFile:  caFile,
+			SrvCertFile: srvCert,
+			SrvKeyFile:  srvKey,
+			CaCertLnk:   caLnk,
+			SrvCertLnk:  srvCertLnk,
+			SrvKeyLnk:   srvKeyLnk,
+		}
+	}
+
+	relink := func(t *testing.T, cert, key, ca string) {
+		t.Helper()
+		os.Remove(srvCertLnk)
+		os.Remove(srvKeyLnk)
+		os.Remove(caLnk)
+		if err := os.Symlink(cert, srvCertLnk); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(key, srvKeyLnk); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(ca, caLnk); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertLink := func(t *testing.T, link, want string) {
+		t.Helper()
+		if got, _ := os.Readlink(link); got != want {
+			t.Errorf("%s -> %q, want %q", link, got, want)
+		}
+	}
+
+	t.Run("StaleConfigLinkIsRelinked", func(t *testing.T) {
+		// A previous run provisioned a *different* cert and left the links
+		// pointing at it (non-rotation target). They must be relinked to the
+		// currently-configured files.
+		oldCert := filepath.Join(tempDir, "old_server.crt")
+		oldKey := filepath.Join(tempDir, "old_server.key")
+		oldCa := filepath.Join(tempDir, "old_ca.pem")
+		for _, f := range []string{oldCert, oldKey, oldCa} {
+			if err := os.WriteFile(f, []byte("stale"), 0644); err != nil {
+				t.Fatalf("write %s: %v", f, err)
+			}
+		}
+		relink(t, oldCert, oldKey, oldCa)
+
+		if _, _, err := SrvAdvConfig(newCfg()); err != nil {
+			t.Fatalf("SrvAdvConfig: %v", err)
+		}
+		assertLink(t, srvCertLnk, srvCert)
+		assertLink(t, srvKeyLnk, srvKey)
+		assertLink(t, caLnk, caFile)
+	})
+
+	t.Run("ActiveRotationIsPreserved", func(t *testing.T) {
+		// An in-effect Certz rotation: links point at existing Certz-named
+		// artifacts and must not be clobbered by the config files.
+		rotCert := filepath.Join(tempDir, "gnxi_v1_100_cert.pem")
+		rotKey := filepath.Join(tempDir, "gnxi_v1_100_key.pem")
+		rotCa := filepath.Join(tempDir, "ca_gnxi_v1_100_bundle.pem")
+		for _, f := range []string{rotCert, rotKey, rotCa} {
+			if err := os.WriteFile(f, []byte("rotated"), 0644); err != nil {
+				t.Fatalf("write %s: %v", f, err)
+			}
+		}
+		relink(t, rotCert, rotKey, rotCa)
+
+		if _, _, err := SrvAdvConfig(newCfg()); err != nil {
+			t.Fatalf("SrvAdvConfig: %v", err)
+		}
+		assertLink(t, srvCertLnk, rotCert)
+		assertLink(t, srvKeyLnk, rotKey)
+		assertLink(t, caLnk, rotCa)
+	})
+
+	t.Run("DanglingRotationLinkIsRelinked", func(t *testing.T) {
+		// A rotation-style name whose target is missing is not an active
+		// rotation; it must be relinked to the configured files.
+		relink(t,
+			filepath.Join(tempDir, "gnxi_gone_cert.pem"),
+			filepath.Join(tempDir, "gnxi_gone_key.pem"),
+			filepath.Join(tempDir, "ca_gnxi_gone_bundle.pem"))
+
+		if _, _, err := SrvAdvConfig(newCfg()); err != nil {
+			t.Fatalf("SrvAdvConfig: %v", err)
+		}
+		assertLink(t, srvCertLnk, srvCert)
+		assertLink(t, srvKeyLnk, srvKey)
+		assertLink(t, caLnk, caFile)
+	})
 }
 
 func TestSrvTestConfigLogsAndReturns(t *testing.T) {

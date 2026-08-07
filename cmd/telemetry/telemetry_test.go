@@ -18,6 +18,7 @@ import (
 	testdata "github.com/sonic-net/sonic-gnmi/testdata/tls"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/tls/certprovider"
 	"io"
 	"io/ioutil"
 	"math/big"
@@ -191,6 +192,16 @@ func TestFlags(t *testing.T) {
 	}
 }
 
+// mockSuccessfulGetOptions makes the secure TLS path (cfg.GetOptions ==
+// SrvAdvConfig) return a no-op server option without touching the filesystem,
+// decoupling the telemetry-package tests from the gnmi_server SrvAdvConfig
+// internals (symlink bootstrap, advancedtls credentials, etc.).
+func mockSuccessfulGetOptions(cfg *gnmi.Config) {
+	cfg.GetOptions = func(_ *gnmi.Config) ([]grpc.ServerOption, []certprovider.Provider, error) {
+		return []grpc.ServerOption{grpc.EmptyServerOption{}}, nil, nil
+	}
+}
+
 func TestStartGNMIServer(t *testing.T) {
 	testServerCert := "../../testdata/certs/testserver.cert"
 	testServerKey := "../../testdata/certs/testserver.key"
@@ -235,6 +246,8 @@ func TestStartGNMIServer(t *testing.T) {
 	serverControlSignal := make(chan ServerControlValue, 1)
 	stopSignalHandler := make(chan bool, 1)
 	wg := &sync.WaitGroup{}
+
+	mockSuccessfulGetOptions(cfg)
 
 	exitCalled := false
 	patches.ApplyMethod(reflect.TypeOf(&gnmi.Server{}), "ForceStop", func(_ *gnmi.Server) {
@@ -306,6 +319,8 @@ func TestStartGNMIServerGracefulStop(t *testing.T) {
 	serverControlSignal := make(chan ServerControlValue, 1)
 	stopSignalHandler := make(chan bool, 1)
 	wg := &sync.WaitGroup{}
+
+	mockSuccessfulGetOptions(cfg)
 
 	counter := 0
 	exitCalled := false
@@ -504,6 +519,8 @@ func TestSHA512Checksum(t *testing.T) {
 		t.Errorf("Expected err to be nil, got err %v", err)
 	}
 
+	mockSuccessfulGetOptions(cfg)
+
 	patches := gomonkey.ApplyFunc(tls.LoadX509KeyPair, func(certFile, keyFile string) (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("Mock LoadX509KeyPair error")
 	})
@@ -561,6 +578,8 @@ func TestStartGNMIServerCACert(t *testing.T) {
 	if cfg.ConfigTableName != "GNMI_CLIENT_CERT" {
 		t.Errorf("Expected err to be GNMI_CLIENT_CERT, got %s", cfg.ConfigTableName)
 	}
+
+	mockSuccessfulGetOptions(cfg)
 
 	err = createCACert(testServerCACert)
 
@@ -629,6 +648,11 @@ func TestStartGNMIServerCreateWatcherError(t *testing.T) {
 	patches.ApplyFunc(grpc.Creds, func(credentials.TransportCredentials) grpc.ServerOption {
 		return grpc.EmptyServerOption{}
 	})
+	// Force the secure TLS setup to fail so startGNMIServer takes the
+	// "wait for certs" path, which is where the fsnotify watcher is created.
+	cfg.GetOptions = func(_ *gnmi.Config) ([]grpc.ServerOption, []certprovider.Provider, error) {
+		return nil, nil, fmt.Errorf("mock GetOptions error")
+	}
 	patches.ApplyFunc(fsnotify.NewWatcher, func() (*fsnotify.Watcher, error) {
 		return nil, errors.New("mock newwatcher error")
 	})
@@ -678,11 +702,19 @@ func TestStartGNMIServerSlowCerts(t *testing.T) {
 	atomic.StoreInt32(&shouldFail, 1)
 	serveStarted := make(chan bool, 1)
 
-	patches := gomonkey.ApplyFunc(tls.LoadX509KeyPair, func(certFile, keyFile string) (tls.Certificate, error) {
+	// The secure path now builds TLS options via cfg.GetOptions (SrvAdvConfig),
+	// which serves certs through advancedtls per-connection reload. Simulate
+	// certs that are not ready yet: fail once so the server waits, then succeed
+	// after a ServerStart signal.
+	cfg.GetOptions = func(_ *gnmi.Config) ([]grpc.ServerOption, []certprovider.Provider, error) {
 		if atomic.LoadInt32(&shouldFail) == 1 {
 			atomic.StoreInt32(&shouldFail, 0)
-			return tls.Certificate{}, fmt.Errorf("Mock LoadX509KeyPair error")
+			return nil, nil, fmt.Errorf("Mock GetOptions error")
 		}
+		return []grpc.ServerOption{grpc.EmptyServerOption{}}, nil, nil
+	}
+
+	patches := gomonkey.ApplyFunc(tls.LoadX509KeyPair, func(certFile, keyFile string) (tls.Certificate, error) {
 		return tls.Certificate{}, nil
 	})
 	patches.ApplyFunc(computeSHA512Checksum, func(file string) {
@@ -753,6 +785,17 @@ func TestStartGNMIServerSlowCACerts(t *testing.T) {
 	})
 	patches.ApplyFunc(computeSHA512Checksum, func(file string) {
 	})
+	// The secure path builds TLS options (including CA/client-cert setup) via
+	// cfg.GetOptions (SrvAdvConfig). Simulate CA material that is not ready yet:
+	// fail once so the server waits, then succeed after a ServerStart signal.
+	cfg.GetOptions = func(_ *gnmi.Config) ([]grpc.ServerOption, []certprovider.Provider, error) {
+		if atomic.LoadInt32(&shouldFail) == 1 {
+			atomic.StoreInt32(&shouldFail, 0)
+			return nil, nil, fmt.Errorf("Mock GetOptions CA error")
+		}
+		return []grpc.ServerOption{grpc.EmptyServerOption{}}, nil, nil
+	}
+
 	patches.ApplyFunc(ioutil.ReadFile, func(_ string) ([]byte, error) {
 		if atomic.LoadInt32(&shouldFail) == 1 {
 			return []byte("mock data"), fmt.Errorf("Mock ioutil ReadFile error")

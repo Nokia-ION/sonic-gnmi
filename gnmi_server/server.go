@@ -243,6 +243,7 @@ type Config struct {
 	SrvCertFile              string // Path to the first server's certificate.
 	SrvKeyFile               string // Path to the first server's private key.
 	CertCRLConfig            string // Path to the CRL directory. Disable if empty.
+	AllowNoClientCert        bool   // Request but do not require a client certificate (mirrors tls.RequestClientCert).
 	IntManFile               string // Path to the Integrity Manifest file.
 	CertzMetaFile            string // Path to JSON file with gRPC credential metadata.
 	FedPolicyFile            string // Path to federation policy file.
@@ -416,29 +417,40 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 	defer muPath.Unlock()
 
 	log.V(1).Infof("Setting server credentials using: %v; %v; %v; %v; %v; %v;", cfg.CaCertLnk, cfg.CaCertFile, cfg.SrvCertLnk, cfg.SrvCertFile, cfg.SrvKeyLnk, cfg.SrvKeyFile)
-	// CA Certificate Check
+	// CA Certificate Check. Link the configured CA on start unless a gNSI
+	// Certz rotation is currently in effect (then keep the rotated bundle so
+	// it survives restarts). This lets a changed config CA take effect and
+	// heals stale non-rotation links.
 	if cfg.CaCertFile != "" {
 		if _, err := os.Stat(cfg.CaCertFile); err != nil {
 			return nil, nil, fmt.Errorf("CA certificate file not found: %v", err)
 		}
-		if !isSymlinkValid(cfg.CaCertLnk) {
+		if !symlinkPointsToRotation(cfg.CaCertLnk) {
 			atomicSetCACert(cfg, cfg.CaCertFile)
 		}
 	} else {
 		log.V(1).Infof("CaCertFile is empty; client certificate verification will be disabled.")
 	}
-	// Server Certificate & Key Check (Mandatory for TLS)
-	if !isSymlinkValid(cfg.SrvCertLnk) || !isSymlinkValid(cfg.SrvKeyLnk) {
+	// Server Certificate & Key Check (Mandatory for TLS). Same policy: (re)link
+	// the configured server cert/key on start unless a Certz rotation is in
+	// effect for both links. Certz rotates the pair together, so we treat them
+	// as a unit.
+	if !symlinkPointsToRotation(cfg.SrvCertLnk) || !symlinkPointsToRotation(cfg.SrvKeyLnk) {
 		if cfg.SrvCertFile == "" || cfg.SrvKeyFile == "" {
-			return nil, nil, fmt.Errorf("server certificate or key file path is empty")
+			// No configured material to (re)link. Fall back to any existing
+			// valid symlinks; only fail if there is nothing usable to serve.
+			if !isSymlinkValid(cfg.SrvCertLnk) || !isSymlinkValid(cfg.SrvKeyLnk) {
+				return nil, nil, fmt.Errorf("server certificate or key file path is empty")
+			}
+		} else {
+			if _, err := os.Stat(cfg.SrvCertFile); err != nil {
+				return nil, nil, fmt.Errorf("server certificate file stat error: %v", err)
+			}
+			if _, err := os.Stat(cfg.SrvKeyFile); err != nil {
+				return nil, nil, fmt.Errorf("server key file stat error: %v", err)
+			}
+			atomicSetSrvCertKeyPair(cfg, cfg.SrvCertFile, cfg.SrvKeyFile)
 		}
-		if _, err := os.Stat(cfg.SrvCertFile); err != nil {
-			return nil, nil, fmt.Errorf("server certificate file stat error: %v", err)
-		}
-		if _, err := os.Stat(cfg.SrvKeyFile); err != nil {
-			return nil, nil, fmt.Errorf("server key file stat error: %v", err)
-		}
-		atomicSetSrvCertKeyPair(cfg, cfg.SrvCertFile, cfg.SrvKeyFile)
 	}
 
 	providers := []certprovider.Provider{}
@@ -482,25 +494,37 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 				return &advancedtls.RootCertificates{TrustCerts: certPool}, nil
 			},
 		}
-		// If the server want the client to send certificates.
-		serverOption.RequireClientCert = true
+		// Ask the client for a certificate. When AllowNoClientCert is set
+		// (client_auth=false / --allow_no_client_auth, e.g. streaming
+		// telemetry), the certificate is requested but not required: a
+		// client may connect without one, and any cert it does present is
+		// still verified. This mirrors the old static tls.RequestClientCert
+		// semantics so no-cert py_gnmicli clients keep working.
+		serverOption.RequireClientCert = !cfg.AllowNoClientCert
 		// Doing only the certificate check.
 		serverOption.VerificationType = advancedtls.CertVerification
-		// CRL config.
+		// CRL config. The TLS-layer FileWatcher CRL provider consumes locally
+		// provisioned CRL bundles (e.g. rotated via gNSI Certz). It is optional:
+		// client-certificate revocation is also enforced at the application
+		// layer via ClientCertAuthenAndAuthor (see NewServer). If the CRL
+		// directory is not present, skip the TLS-layer provider rather than
+		// refusing to start the server.
 		if cfg.CertCRLConfig != "" {
-			if _, err := os.ReadDir(filepath.Join(cfg.CertCRLConfig, "crl")); err != nil {
-				return nil, nil, err
-			}
-			p, err := advancedtls.NewFileWatcherCRLProvider(advancedtls.FileWatcherOptions{
-				CRLDirectory:    filepath.Join(cfg.CertCRLConfig, "crl"),
-				RefreshDuration: time.Minute,
-			})
-			if err != nil {
-				return nil, nil, err
-			}
-			serverOption.RevocationOptions = &advancedtls.RevocationOptions{
-				DenyUndetermined: false,
-				CRLProvider:      p,
+			crlDir := filepath.Join(cfg.CertCRLConfig, "crl")
+			if _, err := os.ReadDir(crlDir); err != nil {
+				log.V(1).Infof("CRL directory %s not available, skipping TLS-layer CRL provider: %v", crlDir, err)
+			} else {
+				p, err := advancedtls.NewFileWatcherCRLProvider(advancedtls.FileWatcherOptions{
+					CRLDirectory:    crlDir,
+					RefreshDuration: time.Minute,
+				})
+				if err != nil {
+					return nil, nil, err
+				}
+				serverOption.RevocationOptions = &advancedtls.RevocationOptions{
+					DenyUndetermined: false,
+					CRLProvider:      p,
+				}
 			}
 		}
 	}
