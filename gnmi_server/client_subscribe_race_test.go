@@ -76,7 +76,7 @@ func TestClientSendCountersOnSendError(t *testing.T) {
 	}
 
 	stream := &failingSubscribeStream{sendErr: errors.New("test send error")}
-	err := client.send(stream, &sdc.DbClient{})
+	err := client.send(stream, &sdc.DbClient{}, false)
 	if err == nil {
 		t.Fatal("send() returned nil, want send error")
 	}

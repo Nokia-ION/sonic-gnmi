@@ -271,7 +271,10 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 		return err
 	}, c.Close, reauthStop, reauthErr)
 	go c.recv(stream)
-	err = c.send(stream, dc)
+	// For ONCE subscriptions the server must half-close the RPC after the
+	// sync_response is sent (per gNMI spec 3.5.1.4). exitOnSync makes send
+	// return cleanly once the sync_response has been delivered.
+	err = c.send(stream, dc, mode == gnmipb.SubscriptionList_ONCE)
 	close(reauthStop)
 	c.Close()
 	// Wait until all child go routines exited
@@ -382,8 +385,10 @@ func (c *Client) recv(stream gnmipb.GNMI_SubscribeServer) {
 	}
 }
 
-// send runs until process Queue returns an error.
-func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
+// send runs until process Queue returns an error. When exitOnSync is true
+// (ONCE subscriptions) it returns nil after delivering the sync_response,
+// causing Run to half-close the RPC as required by the gNMI spec.
+func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client, exitOnSync bool) error {
 	for {
 		var val *sdc.Value
 		items, err := c.q.Get(1)
@@ -423,5 +428,13 @@ func (c *Client) send(stream gnmipb.GNMI_SubscribeServer, dc sdc.Client) error {
 
 		dc.SentOne(val)
 		log.V(5).Infof("Client %s done sending, msg count %d, msg %v", c, c.sendMsg.Load(), resp)
+
+		if exitOnSync && val != nil && val.GetSyncResponse() {
+			log.V(1).Infof("Client %s sent sync_response for ONCE subscription, closing stream", c)
+			if c.q != nil && !c.q.Disposed() {
+				c.q.Dispose()
+			}
+			return nil
+		}
 	}
 }
