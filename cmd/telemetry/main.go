@@ -43,6 +43,7 @@ const (
 type TelemetryConfig struct {
 	UserAuth                 gnmi.AuthTypes
 	Port                     *int
+	Dscp                     *int
 	UnixSocket               *string
 	LogLevel                 *int
 	CaCert                   *string
@@ -188,6 +189,7 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 	telemetryCfg := &TelemetryConfig{
 		UserAuth:                 gnmi.AuthTypes{"password": false, "cert": false, "jwt": false},
 		Port:                     fs.Int("port", -1, "port to listen on"),
+		Dscp:                     fs.Int("dscp", 32, "DSCP (0..63) applied to served gNMI/gNOI/gNSI (observer) traffic; model-driven equivalent of the vendor 'qos dscp' knob. Sourced from CONFIG_DB GNMI|gnmi:dscp."),
 		UnixSocket:               fs.String("unix_socket", "/var/run/gnmi/gnmi.sock", "Unix socket path for local connections without TLS (set to empty to disable)"),
 		LogLevel:                 fs.Int("v", 2, "log level of process"),
 		ConfigTableName:          fs.String("config_table_name", "", "Config table name"),
@@ -290,6 +292,7 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 
 	cfg := &gnmi.Config{}
 	cfg.Port = int64(*telemetryCfg.Port)
+	cfg.Dscp = int(*telemetryCfg.Dscp)
 	cfg.UnixSocket = *telemetryCfg.UnixSocket
 	cfg.EnableTranslibWrite = bool(*telemetryCfg.GnmiTranslibWrite)
 	cfg.EnableNativeWrite = bool(*telemetryCfg.GnmiNativeWrite)
