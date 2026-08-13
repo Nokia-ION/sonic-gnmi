@@ -358,10 +358,17 @@ func (c *Client) recv(stream gnmipb.GNMI_SubscribeServer) {
 			return
 		case io.EOF:
 			log.V(1).Infof("Client %s received io.EOF", c)
-			if c.subscribe.Mode == gnmipb.SubscriptionList_STREAM {
-				// The client->server could be closed after the sending the subscription list.
-				// EOF is not a indication of client is not listening.
-				// Instead stream.Context() which is signaled once the underlying connection is terminated.
+			if c.subscribe.Mode != gnmipb.SubscriptionList_POLL {
+				// For STREAM and ONCE subscriptions the client is allowed to
+				// half-close its send direction right after sending the
+				// SubscriptionList (gNMI spec 3.5.1.4). This EOF is not an
+				// indication that the client stopped listening, so we must not
+				// dispose the queue here: doing so races OnceRun/StreamRun while
+				// they are still gathering data and surfaces as "queue: disposed",
+				// dropping the response (and sync_response) entirely.
+				// For ONCE, send() self-disposes the queue after delivering the
+				// sync_response. In all cases we wait for the underlying
+				// connection to actually terminate before cleaning up.
 				log.V(1).Infof("Waiting for client '%s'", c)
 				// This context is done when the client connection is terminated.
 				<-stream.Context().Done()
