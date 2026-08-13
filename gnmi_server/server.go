@@ -40,6 +40,8 @@ import (
 	gnoi_debug_pb "github.com/openconfig/gnoi/debug"
 	"github.com/openconfig/gnoi/factory_reset"
 	gnoi_system_pb "github.com/openconfig/gnoi/system"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"google.golang.org/grpc/credentials"
 
 	gnoi_file_pb "github.com/openconfig/gnoi/file"
@@ -66,7 +68,39 @@ var enableConfigDbJournal = flag.Bool("enable_config_db_journal", false, "enable
 var (
 	muPath             = &sync.RWMutex{}
 	supportedEncodings = []gnmipb.Encoding{gnmipb.Encoding_JSON, gnmipb.Encoding_JSON_IETF, gnmipb.Encoding_PROTO}
+
+	// muTOS guards IPToConn, which tracks accepted TCP connections so their
+	// IP ToS / IPv6 Traffic-Class (DSCP) can be adjusted after the RPC starts.
+	muTOS    = &sync.RWMutex{}
+	IPToConn = map[net.Addr]net.Conn{}
 )
+
+// DSCP/ToS marking for the gNMI/gNxI control plane (Arista "qos dscp"
+// equivalent). Values are the full ToS byte: DSCP occupies the top 6 bits, so
+// AF4 (0x80) == DSCP 32 and NC1 (0xC0) == DSCP 48.
+const (
+	AF4 = 0x80 // observer gNxI connections (streaming telemetry) -> DSCP 32
+	NC1 = 0xC0 // controller gNxI connections (initial/control)   -> DSCP 48
+)
+
+// observerTOS is the ToS byte applied to served (observer) gNxI connections.
+// It defaults to AF4 (DSCP 32) but is overridden at server start-up from the
+// configured DSCP value (CONFIG_DB GNMI|gnmi:dscp, surfaced via Config.Dscp),
+// making the vendor "qos dscp" knob model-driven. Only the served/observer
+// marking is configurable; NC1 (control-plane, applied at accept-time) is
+// fixed. observerTOS is set once during NewServer before Serve() accepts
+// connections, so it needs no additional synchronization.
+var observerTOS = AF4
+
+// dscpToTOS converts a 6-bit DSCP value (0..63) into the full IP ToS / IPv6
+// Traffic-Class byte (DSCP occupies the top 6 bits). Values outside 0..63 fall
+// back to the built-in AF4 default.
+func dscpToTOS(dscp int) int {
+	if dscp < 0 || dscp > 63 {
+		return AF4
+	}
+	return dscp << 2
+}
 
 // Path to the `/var/log/telemetry-con` directory on the `host` side.
 const (
@@ -217,6 +251,12 @@ type Config struct {
 	// Port for the Server to listen on. If 0 or unset the Server will pick a port
 	// for this Server. Port > 0 enables the TCP listener.
 	Port int64
+	// Dscp is the DSCP value (0..63) applied to served (observer) gNxI
+	// connections, i.e. the model-driven equivalent of the vendor "qos dscp"
+	// knob. It is sourced from CONFIG_DB GNMI|gnmi:dscp (via telemetry.sh),
+	// which defaults it to 32 when unconfigured. Values in 0..63 are honored;
+	// anything outside that range falls back to the built-in AF4 default.
+	Dscp int
 	// UnixSocket is the path to a Unix domain socket to listen on.
 	// When set, an additional listener is created for local connections without TLS.
 	UnixSocket          string
@@ -585,6 +625,11 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 	if config == nil {
 		return nil, errors.New("config not provided")
 	}
+	// Apply the configured DSCP (CONFIG_DB GNMI|gnmi:dscp, surfaced via
+	// Config.Dscp) to the served/observer marking. Done here, before Serve()
+	// accepts any connection, so no locking is required.
+	observerTOS = dscpToTOS(config.Dscp)
+	log.V(1).Infof("gNMI observer DSCP set to %d (ToS 0x%x)", config.Dscp, observerTOS)
 	var providers []certprovider.Provider
 	if err := common_utils.ValidateSharedMemoryKey(); err != nil {
 		return nil, fmt.Errorf("invalid shared-memory configuration: %w", err)
@@ -737,6 +782,102 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 	return srv, nil
 }
 
+// listenerWrapper marks every accepted TCP connection with the NC1 DSCP so
+// control-plane traffic is prioritized from the moment the connection is
+// established. Once an RPC starts serving, setTOSToAF4 downgrades observer
+// (telemetry) streams to AF4 (DSCP 32). Only the TCP listener is wrapped; the
+// Unix-domain-socket listener is left untouched (ToS is meaningless there).
+type listenerWrapper struct {
+	net.Listener
+}
+
+func (l *listenerWrapper) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		log.V(5).Infof("listener.Accept() failed: %v", err)
+		return nil, err
+	}
+	// DSCP marking is best-effort: a failure here must not fail Accept(),
+	// because gRPC treats an Accept error as fatal and tears down the whole
+	// listener. Log and serve the connection unmarked instead.
+	if c.RemoteAddr().(*net.TCPAddr).IP.To16() != nil && c.RemoteAddr().(*net.TCPAddr).IP.To4() == nil {
+		log.V(5).Infof("%v is IPv6", c.RemoteAddr())
+		if err := ipv6.NewConn(c).SetTrafficClass(NC1); err != nil {
+			log.Warningf("failed to set NC1 IPv6 TC on %v: %v", c.RemoteAddr(), err)
+		}
+	} else {
+		log.V(5).Infof("%v is IPv4", c.RemoteAddr())
+		if err := ipv4.NewConn(c).SetTOS(NC1); err != nil {
+			log.Warningf("failed to set NC1 IPv4 TOS on %v: %v", c.RemoteAddr(), err)
+		}
+	}
+	log.V(5).Infof("ToS/TC set to NC1 on %v for %v", l.Listener.Addr(), c.RemoteAddr())
+	muTOS.Lock()
+	defer muTOS.Unlock()
+	IPToConn[c.RemoteAddr()] = c
+	return c, nil
+}
+
+// cleanupIPToConn removes the connection tracked for the given RPC context once
+// we have attempted to set its ToS/TC (or determined it is no longer needed).
+func cleanupIPToConn(ctx context.Context) {
+	pr, ok := peer.FromContext(ctx)
+	if !ok {
+		log.V(5).Infof("cleanupIPToConn: failed to get peer from ctx")
+		return
+	}
+	if pr.Addr == net.Addr(nil) {
+		log.V(5).Infof("cleanupIPToConn: failed to get peer address")
+		return
+	}
+	muTOS.Lock()
+	defer muTOS.Unlock()
+	delete(IPToConn, pr.Addr)
+}
+
+// setTOSToAF4AndCleanupIPToConn is used by one-shot RPCs (Get/Set): it marks the
+// connection AF4 and then forgets it.
+func setTOSToAF4AndCleanupIPToConn(ctx context.Context) error {
+	defer cleanupIPToConn(ctx)
+	return setTOSToAF4(ctx)
+}
+
+// setTOSToAF4 downgrades the connection backing the current RPC to AF4 (DSCP 32).
+// It is a no-op for connections that are not tracked (e.g. Unix-domain-socket
+// clients), which keeps it safe to call from any handler.
+func setTOSToAF4(ctx context.Context) error {
+	pr, ok := peer.FromContext(ctx)
+	if !ok {
+		return fmt.Errorf("setTOSToAF4: failed to get peer from ctx")
+	}
+	if pr.Addr == net.Addr(nil) {
+		return fmt.Errorf("setTOSToAF4: failed to get peer address")
+	}
+	log.V(5).Infof("setTOSToAF4: changing ToS/TC for connection from %v", pr)
+	muTOS.RLock()
+	defer muTOS.RUnlock()
+	c, ok := IPToConn[pr.Addr]
+	if !ok {
+		log.V(5).Infof("setTOSToAF4: no tracked connection from %v (OK: ToS/TC only needs to be set once, or non-TCP client)", pr.Addr)
+		return nil
+	}
+	if pr.Addr != c.RemoteAddr() {
+		return fmt.Errorf("setTOSToAF4: peer (%v) != c.RemoteAddr (%v)", pr.Addr, c.RemoteAddr())
+	}
+	if pr.Addr.(*net.TCPAddr).IP.To16() != nil && pr.Addr.(*net.TCPAddr).IP.To4() == nil {
+		log.V(5).Infof("setTOSToAF4: %v is IPv6", c.RemoteAddr())
+		if err := ipv6.NewConn(c).SetTrafficClass(observerTOS); err != nil {
+			return fmt.Errorf("setTOSToAF4: failed to set observer IPv6 TC (0x%x): %v", observerTOS, err)
+		}
+	} else {
+		log.V(5).Infof("setTOSToAF4: %v is IPv4", c.RemoteAddr())
+		if err := ipv4.NewConn(c).SetTOS(observerTOS); err != nil {
+			return fmt.Errorf("setTOSToAF4: failed to set observer IPv4 TOS (0x%x): %v", observerTOS, err)
+		}
+	}
+	return nil
+}
+
 // Serve will start the Server serving and block until closed.
 // If both TCP and UDS listeners are configured, both are served concurrently.
 // A failure in one listener does not affect the other; Serve blocks until all
@@ -756,7 +897,10 @@ func (srv *Server) Serve() error {
 		go func() {
 			defer wg.Done()
 			log.V(1).Infof("Starting TCP server on %s", srv.lis.Addr().String())
-			if err := srv.s.Serve(srv.lis); err != nil {
+			// Wrap the TCP listener so each accepted connection is marked with
+			// the NC1 DSCP (control-plane QoS); observer streams are later
+			// downgraded to AF4 (DSCP 32) once the RPC starts serving.
+			if err := srv.s.Serve(&listenerWrapper{srv.lis}); err != nil {
 				log.Errorf("TCP server error: %v", err)
 				mu.Lock()
 				errs = append(errs, fmt.Sprintf("TCP server: %v", err))
@@ -946,6 +1090,14 @@ func (s *Server) Subscribe(stream gnmipb.GNMI_SubscribeServer) error {
 		return grpc.Errorf(codes.InvalidArgument, "failed to get peer address")
 	}
 
+	// Downgrade this (observer) connection's DSCP to AF4 (32) for streaming
+	// telemetry, then stop tracking it: the ToS/TC only needs to be set once,
+	// and long-lived subscriptions must not leak entries in IPToConn.
+	// Best-effort: a failure here must not fail the subscription.
+	if err := setTOSToAF4AndCleanupIPToConn(ctx); err != nil {
+		log.V(1).Infof("Subscribe: setTOSToAF4 failed for %v: %v", pr.Addr, err)
+	}
+
 	/* TODO: authorize the user
 	msg, ok := credentials.AuthorizeUser(ctx)
 	if !ok {
@@ -1044,6 +1196,11 @@ func nativeSetTarget(prefix *gnmipb.Path, paths []*gnmipb.Path) string {
 // Get implements the Get RPC in gNMI spec.
 func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetResponse, error) {
 	common_utils.IncCounter(common_utils.GNMI_GET)
+
+	// Mark this connection's DSCP to AF4 (32). Best-effort; never fail the RPC.
+	if err := setTOSToAF4AndCleanupIPToConn(ctx); err != nil {
+		log.V(1).Infof("Get: setTOSToAF4 failed: %v", err)
+	}
 
 	if req.GetType() != gnmipb.GetRequest_ALL {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
@@ -1196,6 +1353,11 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 	e := s.ReqFromMaster(req, &s.masterEID)
 	if e != nil {
 		return nil, e
+	}
+
+	// Mark this connection's DSCP to AF4 (32). Best-effort; never fail the RPC.
+	if err := setTOSToAF4AndCleanupIPToConn(ctx); err != nil {
+		log.V(1).Infof("Set: setTOSToAF4 failed: %v", err)
 	}
 
 	common_utils.IncCounter(common_utils.GNMI_SET)
