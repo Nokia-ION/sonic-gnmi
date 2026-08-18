@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Azure/sonic-mgmt-common/translib"
+	pathutil "github.com/Azure/sonic-mgmt-common/translib/path"
 	"github.com/Workiva/go-datastructures/queue"
 	log "github.com/golang/glog"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
@@ -208,7 +209,20 @@ func (ts *translSubscriber) toPrefix(path string) *gnmipb.Path {
 	p, _ := ygot.StringToStructuredPath(path)
 	p.Target = ts.client.prefix.GetTarget()
 	p.Origin = ts.client.prefix.GetOrigin()
+	ts.stripOCModulePrefix(p)
 	return p
+}
+
+// stripOCModulePrefix removes YANG module prefixes from path elements when the
+// request origin is "openconfig". ygnmi/ygot resolve schema nodes by unqualified
+// names (e.g. "interfaces") once origin is set; leaving
+// "openconfig-interfaces:interfaces" in the notification prefix makes a Subscribe
+// ONCE Get appear as "value not present" even though the DUT returned data.
+func (ts *translSubscriber) stripOCModulePrefix(p *gnmipb.Path) {
+	if p == nil || ts.client == nil || ts.client.prefix.GetOrigin() != "openconfig" {
+		return
+	}
+	pathutil.RemoveModulePrefix(p)
 }
 
 func defaultMsgBuilder(v *translib.SubscribeResponse, ts *translSubscriber) (*gnmipb.Notification, error) {
@@ -246,6 +260,7 @@ func defaultMsgBuilder(v *translib.SubscribeResponse, ts *translSubscriber) (*gn
 		if err != nil {
 			return nil, err
 		}
+		ts.stripOCModulePrefix(p)
 		insertFirstPathElem(p, extraPrefix)
 		n.Delete = append(n.Delete, p)
 	}
@@ -373,7 +388,9 @@ func (c *ygotCache) deleteMsgBuilder(ts *translSubscriber) (*gnmipb.Notification
 	for path := range c.values {
 		if !ts.rcvdPaths[path] {
 			log.V(3).Infof("%s deleted", path)
-			deletePaths = append(deletePaths, c.toDeletePath(path))
+			dp := c.toDeletePath(path)
+			ts.stripOCModulePrefix(dp)
+			deletePaths = append(deletePaths, dp)
 			delete(c.values, path)
 		}
 	}
@@ -391,9 +408,12 @@ func (c *ygotCache) toDeletePath(path string) *gnmipb.Path {
 	p, _ := ygot.StringToStructuredPath(path)
 	// p will be parent container path when subscribing to a leaf.
 	// Append the leaf suffix to p if p is shorter than subscribe path.
+	// Copy elems so later module-prefix stripping cannot mutate the cache pattern.
 	if n := len(p.Elem); n < len(c.pattern.Elem) {
-		suffix := c.pattern.Elem[n:]
-		p.Elem = append(p.Elem, suffix...)
+		for _, e := range c.pattern.Elem[n:] {
+			ne := &gnmipb.PathElem{Name: e.Name, Key: e.Key}
+			p.Elem = append(p.Elem, ne)
+		}
 	}
 	return p
 }
