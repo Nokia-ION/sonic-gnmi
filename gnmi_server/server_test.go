@@ -6721,6 +6721,34 @@ func TestParseOrigin(t *testing.T) {
 	}
 }
 
+func TestPrefixWithOrigin(t *testing.T) {
+	got := prefixWithOrigin(nil, "openconfig")
+	if got == nil || got.GetOrigin() != "openconfig" {
+		t.Errorf("nil prefix: got %v, want origin openconfig", got)
+	}
+
+	p := &gnmipb.Path{Target: "dut1", Elem: []*gnmipb.PathElem{{Name: "interfaces"}}}
+	got = prefixWithOrigin(p, "openconfig")
+	if got.GetOrigin() != "openconfig" || got.GetTarget() != "dut1" {
+		t.Errorf("empty origin prefix: got origin=%q target=%q", got.GetOrigin(), got.GetTarget())
+	}
+	if len(got.GetElem()) != 1 || got.GetElem()[0].GetName() != "interfaces" {
+		t.Errorf("elems not preserved: got %v", got.GetElem())
+	}
+	if p.GetOrigin() != "" {
+		t.Errorf("request prefix was modified, origin=%q", p.GetOrigin())
+	}
+
+	p = &gnmipb.Path{Origin: "sonic-db"}
+	if got = prefixWithOrigin(p, "openconfig"); got != p {
+		t.Errorf("prefix with origin should be returned as is: got %v", got)
+	}
+
+	if prefixWithOrigin(nil, "") != nil {
+		t.Errorf("empty origin should leave nil prefix unchanged")
+	}
+}
+
 func TestMasterArbitration(t *testing.T) {
 	s := createServer(t, 8088)
 	// Turn on Master Arbitration

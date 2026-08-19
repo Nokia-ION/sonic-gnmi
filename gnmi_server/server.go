@@ -1242,6 +1242,24 @@ func ParseOrigin(paths []*gnmipb.Path) (string, error) {
 	return origin, nil
 }
 
+// prefixWithOrigin returns a copy of prefix with Origin set to the resolved
+// origin of the request. ygnmi and gnmic carry origin on each path
+// (openconfig:/interfaces/...) instead of on the request prefix, while
+// TranslClient reads origin from the prefix only, and derives its Subscribe
+// notification prefixes from it. Callers must not modify the request message,
+// hence the copy.
+func prefixWithOrigin(prefix *gnmipb.Path, origin string) *gnmipb.Path {
+	if origin == "" || prefix.GetOrigin() != "" {
+		return prefix
+	}
+	if prefix == nil {
+		return &gnmipb.Path{Origin: origin}
+	}
+	p := proto.Clone(prefix).(*gnmipb.Path)
+	p.Origin = origin
+	return p
+}
+
 func IsNativeOrigin(origin string) bool {
 	return origin == "sonic-db"
 }
@@ -1354,6 +1372,7 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 			dc, err = sdc.NewMixedDbClient(paths, prefix, origin, encoding, s.config.ZmqPort, s.config.Vrf, &targetDbName)
 			authTarget = "gnmi_" + targetDbName
 		} else {
+			prefix = prefixWithOrigin(prefix, origin)
 			dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions)
 		}
 	}

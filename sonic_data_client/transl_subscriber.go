@@ -214,10 +214,9 @@ func (ts *translSubscriber) toPrefix(path string) *gnmipb.Path {
 }
 
 // stripOCModulePrefix removes YANG module prefixes from path elements when the
-// request origin is "openconfig". ygnmi/ygot resolve schema nodes by unqualified
-// names (e.g. "interfaces") once origin is set; leaving
-// "openconfig-interfaces:interfaces" in the notification prefix makes a Subscribe
-// ONCE Get appear as "value not present" even though the DUT returned data.
+// request origin is "openconfig" (on the Subscribe prefix, or copied there from
+// a path origin such as openconfig:/interfaces/...). ygnmi/ygot resolve schema
+// nodes by unqualified names (e.g. "interfaces") once origin is set.
 func (ts *translSubscriber) stripOCModulePrefix(p *gnmipb.Path) {
 	if p == nil || ts.client == nil || ts.client.prefix.GetOrigin() != "openconfig" {
 		return
