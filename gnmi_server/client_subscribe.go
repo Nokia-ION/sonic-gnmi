@@ -198,6 +198,7 @@ func (c *Client) Run(stream gnmipb.GNMI_SubscribeServer, config *Config) (err er
 
 	authTarget := "gnmi"
 	if origin == "openconfig" {
+		prefix = prefixWithOrigin(prefix, origin)
 		dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions, sdc.TranslWildcardOption{})
 	} else if IsNativeOrigin(origin) {
 		var targetDbName string
