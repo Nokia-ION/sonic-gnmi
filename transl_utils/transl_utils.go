@@ -6,9 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/syslog"
+	"reflect"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/Azure/sonic-mgmt-common/translib/ocbinds"
 	pathutil "github.com/Azure/sonic-mgmt-common/translib/path"
 	"github.com/Azure/sonic-mgmt-common/translib/tlerr"
 	log "github.com/golang/glog"
@@ -143,6 +147,12 @@ func PopulateClientPaths(prefix *gnmipb.Path, paths []*gnmipb.Path, path2URI *ma
 		opts = append(opts, &pathutil.AddWildcardKeys{})
 	}
 	for _, path := range paths {
+		if IsWholeTreePath(prefix, path) {
+			if err := populateWholeTreePaths(prefix, path, path2URI, opts...); err != nil {
+				return err
+			}
+			continue
+		}
 		req, err := ConvertToURI(prefix, path, opts...)
 		if err != nil {
 			return err
@@ -151,6 +161,82 @@ func PopulateClientPaths(prefix *gnmipb.Path, paths []*gnmipb.Path, path2URI *ma
 	}
 
 	return nil
+}
+
+// IsWholeTreePath reports whether prefix and path together address the root of
+// the data tree, which per the gNMI spec means the client asked for everything.
+func IsWholeTreePath(prefix, path *gnmipb.Path) bool {
+	return len(prefix.GetElem()) == 0 && len(prefix.GetElement()) == 0 &&
+		len(path.GetElem()) == 0 && len(path.GetElement()) == 0
+}
+
+// populateWholeTreePaths expands a root request into one entry per top level
+// container. Translib holds no mapping for the root node itself, so a request
+// for the whole tree is served as the union of its top level subtrees.
+func populateWholeTreePaths(prefix, path *gnmipb.Path, path2URI *map[*gnmipb.Path]string, opts ...pathutil.PathValidatorOpt) error {
+	roots := wholeTreeRoots()
+	if len(roots) == 0 {
+		return fmt.Errorf("no top level paths available to serve the whole data tree")
+	}
+	for _, name := range roots {
+		p := &gnmipb.Path{
+			Origin: path.GetOrigin(),
+			Target: path.GetTarget(),
+			Elem:   []*gnmipb.PathElem{{Name: name}},
+		}
+		uri, err := ConvertToURI(prefix, p, opts...)
+		if err != nil {
+			return err
+		}
+		(*path2URI)[p] = uri
+	}
+	return nil
+}
+
+var (
+	wholeTreeRootsOnce sync.Once
+	wholeTreeRootNames []string
+)
+
+// wholeTreeRoots returns the module qualified names of the top level containers
+// that make up the OpenConfig data tree, e.g. "openconfig-acl:acl".
+//
+// The list is the intersection of the ygot bindings with the models translib
+// reports as supported. Both halves are needed: the bindings supply the
+// container name each module contributes, while ocbinds also carries modules
+// such as openconfig-bgp and openconfig-routing-policy that have no translib
+// mapping and would fail translation if included.
+func wholeTreeRoots() []string {
+	wholeTreeRootsOnce.Do(func() {
+		supported := make(map[string]bool)
+		models, err := translib.GetModels()
+		if err != nil {
+			log.Warningf("Cannot determine supported models: %v", err)
+			return
+		}
+		for _, m := range models {
+			supported[m.Name] = true
+		}
+
+		seen := make(map[string]bool)
+		dt := reflect.TypeOf(ocbinds.Device{})
+		for i := 0; i < dt.NumField(); i++ {
+			f := dt.Field(i)
+			module := f.Tag.Get("module")
+			if !strings.HasPrefix(module, "openconfig-") || !supported[module] {
+				continue
+			}
+			name := module + ":" + f.Tag.Get("path")
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			wholeTreeRootNames = append(wholeTreeRootNames, name)
+		}
+		sort.Strings(wholeTreeRootNames)
+		log.V(1).Infof("Whole tree request expands to %v", wholeTreeRootNames)
+	})
+	return wholeTreeRootNames
 }
 
 // ConvertToURI returns translib path for a gnmi Path
