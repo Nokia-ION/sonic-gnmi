@@ -312,8 +312,17 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 	sampleCache := make(map[string]*ygotCache)
 
 	for i, sub := range subscribe.Subscription {
+		uri, ok := c.path2URI[sub.Path]
+		if !ok {
+			// A whole tree path is served as the union of its top level
+			// subtrees, which a STREAM subscription cannot express yet.
+			enqueFatalMsgTranslib(c, fmt.Sprintf(
+				"Subscribe operation failed with error = whole tree path %q is supported only in ONCE and POLL modes",
+				sub.Path))
+			return
+		}
 		translPaths[i].ID = uint32(i)
-		translPaths[i].Path = c.path2URI[sub.Path]
+		translPaths[i].Path = uri
 		translPaths[i].Mode = getTranslNotificationType(sub.Mode)
 	}
 
