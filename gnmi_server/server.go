@@ -473,7 +473,7 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 			return nil, nil, fmt.Errorf("CA certificate file not found: %v", err)
 		}
 		if !symlinkPointsToRotation(cfg.CaCertLnk) {
-			atomicSetCACert(cfg, cfg.CaCertFile)
+			atomicSetCACert(cfg, defaultProfile, cfg.CaCertFile)
 		}
 	} else {
 		log.V(1).Infof("CaCertFile is empty; client certificate verification will be disabled.")
@@ -496,7 +496,7 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 			if _, err := os.Stat(cfg.SrvKeyFile); err != nil {
 				return nil, nil, fmt.Errorf("server key file stat error: %v", err)
 			}
-			atomicSetSrvCertKeyPair(cfg, cfg.SrvCertFile, cfg.SrvKeyFile)
+			atomicSetSrvCertKeyPair(cfg, defaultProfile, cfg.SrvCertFile, cfg.SrvKeyFile)
 		}
 	}
 
