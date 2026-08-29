@@ -1285,6 +1285,18 @@ func nativeSetTarget(prefix *gnmipb.Path, paths []*gnmipb.Path) string {
 	return target
 }
 
+// checkDataTypeSupported rejects a data type filter on the data paths that
+// cannot honour it. Only translib filters its response by data type; the other
+// paths would reply with more data than was asked for.
+func checkDataTypeSupported(dataType gnmipb.GetRequest_DataType, target string) error {
+	if dataType == gnmipb.GetRequest_ALL {
+		return nil
+	}
+	common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
+	return status.Errorf(codes.Unimplemented, "unsupported request type %s for target %q",
+		gnmipb.GetRequest_DataType_name[int32(dataType)], target)
+}
+
 // Get implements the Get RPC in gNMI spec.
 func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetResponse, error) {
 	common_utils.IncCounter(common_utils.GNMI_GET)
@@ -1294,10 +1306,15 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 		log.V(1).Infof("Get: setTOSToAF4 failed: %v", err)
 	}
 
-	if req.GetType() != gnmipb.GetRequest_ALL {
+	// CONFIG/STATE/OPERATIONAL are handled by the translib data path only. The
+	// type is passed to it through the request context, see TranslProcessGet.
+	dataType := req.GetType()
+	if _, ok := gnmipb.GetRequest_DataType_name[int32(dataType)]; !ok {
 		common_utils.IncCounter(common_utils.GNMI_GET_FAIL)
-		return nil, status.Errorf(codes.Unimplemented, "unsupported request type: %s", gnmipb.GetRequest_DataType_name[int32(req.GetType())])
+		return nil, status.Errorf(codes.Unimplemented, "unsupported request type: %v", dataType)
 	}
+	_, ctx = common_utils.GetContext(ctx)
+	common_utils.SetReqParam(ctx, common_utils.KeyGetDataType, dataType)
 	// gNMI path based authorization
 	if s.config.PathzPolicy && len(req.GetPath()) != 0 {
 		newPaths := []*gnmipb.Path{}
@@ -1338,6 +1355,9 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 	var err error
 	// Handle OPERATIONAL target directly without SONiC routing
 	if target == "OPERATIONAL" {
+		if err := checkDataTypeSupported(dataType, target); err != nil {
+			return nil, err
+		}
 		return s.handleOperationalGet(ctx, req, paths, prefix)
 	}
 
@@ -1382,6 +1402,12 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 	defer dc.Close()
+
+	if _, isTransl := dc.(*sdc.TranslClient); !isTransl {
+		if err := checkDataTypeSupported(dataType, target); err != nil {
+			return nil, err
+		}
+	}
 
 	ctx, err = authenticate(s.config, ctx, authTarget, false)
 	if err != nil {
