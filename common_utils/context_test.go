@@ -1,6 +1,9 @@
 package common_utils
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestRetiredCounterSlotsRemainStable(t *testing.T) {
 	tests := []struct {
@@ -30,5 +33,28 @@ func TestRetiredCounterSlotsRemainStable(t *testing.T) {
 
 	if got, want := int(COUNTER_SIZE), 32; got != want {
 		t.Errorf("COUNTER_SIZE = %d, want %d", got, want)
+	}
+}
+
+func TestReqParamUnknownKey(t *testing.T) {
+	ctx := context.Background()
+	val, ok := ReqParam(ctx, "foo")
+	if ok {
+		t.Fatalf("ReqParam didn't return false for unknown key")
+	}
+	if val != nil {
+		t.Fatalf("ReqParam didn't return nil for unknown key")
+	}
+}
+
+func TestSetReqParamRoundTrip(t *testing.T) {
+	_, ctx := GetContext(context.Background())
+	SetReqParam(ctx, KeyGetDataType, "STATE")
+	val, ok := ReqParam(ctx, KeyGetDataType)
+	if !ok {
+		t.Fatalf("ReqParam missed a value that was SetReqParam'd")
+	}
+	if val != "STATE" {
+		t.Fatalf("ReqParam got %v, want STATE", val)
 	}
 }

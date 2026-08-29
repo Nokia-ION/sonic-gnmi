@@ -8,6 +8,7 @@ import (
 	"github.com/Azure/sonic-mgmt-common/translib"
 	"github.com/Azure/sonic-mgmt-common/translib/tlerr"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
+	"github.com/sonic-net/sonic-gnmi/common_utils"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -87,4 +88,39 @@ func TestTranslProcessGet_Success_JSON(t *testing.T) {
 	assert.NotNil(t, typedVal)
 	// Check for compacted JSON (no spaces)
 	assert.Equal(t, []byte(`{"foo":"bar"}`), typedVal.GetJsonIetfVal())
+}
+
+func TestTranslProcessGet_ContentFromDataType(t *testing.T) {
+	origGet := translibGet
+	defer func() { translibGet = origGet }()
+
+	tests := []struct {
+		name    string
+		dt      gnmipb.GetRequest_DataType
+		want    string
+		setType bool
+	}{
+		{name: "default all", want: translib.QueryParametersContentAll},
+		{name: "ALL", dt: gnmipb.GetRequest_ALL, want: translib.QueryParametersContentAll, setType: true},
+		{name: "CONFIG", dt: gnmipb.GetRequest_CONFIG, want: translib.QueryParametersContentConfig, setType: true},
+		{name: "STATE", dt: gnmipb.GetRequest_STATE, want: translib.QueryParametersContentState, setType: true},
+		{name: "OPERATIONAL", dt: gnmipb.GetRequest_OPERATIONAL, want: translib.QueryParametersContentOperational, setType: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotContent string
+			translibGet = func(req translib.GetRequest) (translib.GetResponse, error) {
+				gotContent = req.QueryParams.Content
+				return translib.GetResponse{Payload: []byte(`{}`)}, nil
+			}
+			ctx := context.Background()
+			if tt.setType {
+				_, ctx = common_utils.GetContext(ctx)
+				common_utils.SetReqParam(ctx, common_utils.KeyGetDataType, tt.dt)
+			}
+			_, _, err := TranslProcessGet("/any-path", nil, ctx, gnmipb.Encoding_JSON_IETF)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, gotContent)
+		})
+	}
 }

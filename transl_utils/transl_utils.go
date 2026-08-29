@@ -272,8 +272,22 @@ func getTranslFmtType(encoding gnmipb.Encoding) translib.TranslibFmtType {
 func TranslProcessGet(uriPath string, op *string, ctx context.Context, encoding gnmipb.Encoding) (*gnmipb.TypedValue, *translib.GetResponse, error) {
 	var jv []byte
 	var data []byte
-	rc, _ := common_utils.GetContext(ctx)
-	qp := translib.QueryParameters{Content: "all"}
+	rc, ctx := common_utils.GetContext(ctx)
+
+	qp := translib.QueryParameters{Content: translib.QueryParametersContentAll}
+	if val, ok := common_utils.ReqParam(ctx, common_utils.KeyGetDataType); ok {
+		if dt, ok := val.(gnmipb.GetRequest_DataType); ok {
+			switch dt {
+			case gnmipb.GetRequest_CONFIG:
+				qp.Content = translib.QueryParametersContentConfig
+			case gnmipb.GetRequest_OPERATIONAL:
+				qp.Content = translib.QueryParametersContentOperational
+			case gnmipb.GetRequest_STATE:
+				qp.Content = translib.QueryParametersContentState
+			}
+		}
+	}
+
 	fmtType := getTranslFmtType(encoding)
 	req := translib.GetRequest{Path: uriPath, FmtType: fmtType, User: translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles}, QueryParams: qp}
 	if rc.BundleVersion != nil {

@@ -11,6 +11,8 @@ import (
 // AuthInfo holds data about the authenticated user
 type AuthInfo = authentication.AuthInfo
 
+type ParamKey string
+
 // RequestContext holds metadata about REST request.
 type RequestContext struct {
 
@@ -22,7 +24,16 @@ type RequestContext struct {
 
 	//Bundle Version is the release yang models version.
 	BundleVersion *string
+
+	// Map for request parameters
+	Params map[ParamKey]interface{}
 }
+
+// Keys used to store/retrieve request parameters in RequestContext.Params
+const (
+	// Stores the gNMI Get Request type (All, Config-Data, State-Data, etc.)
+	KeyGetDataType ParamKey = "get:data_type"
+)
 
 type contextkey int
 
@@ -156,9 +167,29 @@ func GetContext(ctx context.Context) (*RequestContext, context.Context) {
 
 	rc := new(RequestContext)
 	rc.ID = fmt.Sprintf("TELEMETRY-%v", atomic.AddUint64(&requestCounter, 1))
+	rc.Params = make(map[ParamKey]interface{})
 
 	ctx = context.WithValue(ctx, requestContextKey, rc)
 	return rc, ctx
+}
+
+func SetReqParam(ctx context.Context, key ParamKey, val interface{}) {
+	rc, _ := GetContext(ctx)
+	if rc.Params == nil {
+		rc.Params = make(map[ParamKey]interface{})
+	}
+	rc.Params[key] = val
+}
+
+func ReqParam(ctx context.Context, key ParamKey) (interface{}, bool) {
+	rc, _ := GetContext(ctx)
+	if rc.Params == nil {
+		return nil, false
+	}
+	if val, ok := rc.Params[key]; ok {
+		return val, true
+	}
+	return nil, false
 }
 
 func GetUsername(ctx context.Context, username *string) {
