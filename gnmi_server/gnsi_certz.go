@@ -14,6 +14,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,12 +24,14 @@ import (
 	log "github.com/golang/glog"
 	certz "github.com/openconfig/gnsi/certz"
 	"github.com/sonic-net/sonic-gnmi/common_utils"
+	ssc "github.com/sonic-net/sonic-gnmi/sonic_service_client"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 const (
 	defaultProfile string = "gnxi"
+	defaultVersion string = "V1"
 	// Prefixes for DB entries
 	certTbl string = "CERT"
 	certId  string = "certificate"
@@ -46,7 +50,13 @@ const (
 
 	backupExt      string = ".bak"
 	credentialsTbl string = "CREDENTIALS"
+
+	// Per-profile symlink and persist dirs so Rotate of a non-gnxi profile
+	// (e.g. a custom SSL identity) does not retarget the gNMI listener certs.
+	certzProfilesDir = "certz_profiles"
 )
+
+var persistentProfilesDir = "/etc/sonic/" + certzProfilesDir
 
 var (
 	certzMu               sync.Mutex
@@ -130,6 +140,7 @@ func NewGNSICertzServer(srv *Server) *GNSICertzServer {
 		// didn't find the default profile, so make it
 		s.profiles[defaultProfile] = s.bootstrapDefaultProfile()
 	}
+	s.restoreCustomProfiles()
 
 	for _, p := range s.profiles {
 		writeEntityFreshness(p.ID, p.ActiveEntities.Cert)
@@ -159,14 +170,128 @@ func NewGNSICertzServer(srv *Server) *GNSICertzServer {
 	return s
 }
 
-func (srv *GNSICertzServer) AddProfile(context.Context, *certz.AddProfileRequest) (*certz.AddProfileResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method AddProfile not implemented")
+func (srv *GNSICertzServer) AddProfile(ctx context.Context, req *certz.AddProfileRequest) (*certz.AddProfileResponse, error) {
+	profileID := req.GetSslProfileId()
+	log.V(2).Infof("Received AddProfile request for profile: %q", profileID)
+	defer log.V(2).Infof("Finished AddProfile request for profile: %q", profileID)
+
+	if profileID == "" {
+		return nil, status.Error(codes.InvalidArgument, "ssl_profile_id cannot be empty")
+	}
+
+	if matched, _ := regexp.MatchString(`^[a-zA-Z0-9._-]+$`, profileID); !matched {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid ssl_profile_id: %q contains invalid characters. Only a-z, A-Z, 0-9, '.', '_', '-' are allowed", profileID)
+	}
+
+	if profileID == "." || profileID == ".." {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid ssl_profile_id: %q is reserved", profileID)
+	}
+
+	certzMu.Lock()
+	defer certzMu.Unlock()
+
+	if _, exists := srv.profiles[profileID]; exists {
+		return nil, status.Errorf(codes.AlreadyExists, "profile %q already exists", profileID)
+	}
+
+	certLnk := getLinkPaths(srv.config, profileID).Cert
+	baseDir := filepath.Dir(certLnk)
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to create profile directory: %v", err)
+	}
+
+	timeNow := uint64(time.Now().Unix())
+	p := &profile{
+		ID: profileID,
+		ActiveEntities: entityGroup{
+			Cert:        &genericEntity{EType: certType, CreatedOn: timeNow, Version: defaultVersion, CertPath: "", KeyPath: "", Final: false},
+			TrustBundle: &genericEntity{EType: tbType, CreatedOn: timeNow, Version: defaultVersion, CertPath: "", Final: false},
+			CrlBundle:   &genericEntity{EType: crlType, CreatedOn: timeNow, Version: defaultVersion, CertPath: "", Final: false},
+			AuthPolicy:  &genericEntity{EType: apType, CreatedOn: timeNow, Version: defaultVersion, CertPath: "", Final: false},
+		},
+	}
+	p.LastEntities = entityGroup{}
+	srv.profiles[profileID] = p
+
+	if err := saveCertzMetadata(srv.config.CertzMetaFile, srv.profiles); err != nil {
+		delete(srv.profiles, profileID)
+		if errRm := os.RemoveAll(baseDir); errRm != nil {
+			log.V(1).Infof("Failed to remove profile directory %q during rollback: %v", baseDir, errRm)
+		}
+		return nil, status.Errorf(codes.Internal, "failed to save profile metadata: %v", err)
+	}
+
+	log.V(2).Infof("Successfully added profile: %q", profileID)
+	return &certz.AddProfileResponse{}, nil
 }
-func (srv *GNSICertzServer) DeleteProfile(context.Context, *certz.DeleteProfileRequest) (*certz.DeleteProfileResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method DeleteProfile not implemented")
+
+func (srv *GNSICertzServer) DeleteProfile(ctx context.Context, req *certz.DeleteProfileRequest) (*certz.DeleteProfileResponse, error) {
+	profileID := req.GetSslProfileId()
+	log.V(2).Infof("Received DeleteProfile request for profile: %q", profileID)
+	defer log.V(2).Infof("Finished DeleteProfile request for profile: %q", profileID)
+
+	if profileID == "" {
+		return nil, status.Error(codes.InvalidArgument, "ssl_profile_id cannot be empty")
+	}
+
+	if profileID == defaultProfile {
+		return nil, status.Errorf(codes.InvalidArgument, "cannot delete default profile (%q)", defaultProfile)
+	}
+
+	certzMu.Lock()
+	defer certzMu.Unlock()
+
+	profile, exists := srv.profiles[profileID]
+	if !exists {
+		return nil, status.Errorf(codes.NotFound, "profile %q not found", profileID)
+	}
+
+	delete(srv.profiles, profileID)
+
+	if err := saveCertzMetadata(srv.config.CertzMetaFile, srv.profiles); err != nil {
+		srv.profiles[profileID] = profile
+		return nil, status.Errorf(codes.Internal, "failed to save profile metadata: %v", err)
+	}
+
+	srv.removeEntityFiles(profile.ActiveEntities.Cert)
+	srv.removeEntityFiles(profile.ActiveEntities.TrustBundle)
+	srv.removeEntityFiles(profile.LastEntities.Cert)
+	srv.removeEntityFiles(profile.LastEntities.TrustBundle)
+
+	profileDir := filepath.Join(filepath.Dir(srv.config.SrvCertLnk), certzProfilesDir, profileID)
+	if err := os.RemoveAll(profileDir); err != nil {
+		log.V(1).Infof("Failed to remove profile symlink directory %q: %v", profileDir, err)
+	}
+	persistDir := filepath.Join(persistentProfilesDir, profileID)
+	if err := os.RemoveAll(persistDir); err != nil {
+		log.V(1).Infof("Failed to remove profile persistent directory %q: %v", persistDir, err)
+	}
+
+	if err := deleteCredentialsMetadataFromDB(certTbl, profileID); err != nil {
+		log.V(1).Infof("Failed to delete credentials metadata from DB for profile %q: %v", profileID, err)
+	}
+
+	srv.deleteSslProfile(profileID)
+
+	return &certz.DeleteProfileResponse{}, nil
 }
-func (srv *GNSICertzServer) GetProfileList(context.Context, *certz.GetProfileListRequest) (*certz.GetProfileListResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetProfileList not implemented")
+
+func (srv *GNSICertzServer) GetProfileList(ctx context.Context, req *certz.GetProfileListRequest) (*certz.GetProfileListResponse, error) {
+	log.V(2).Info("Received GetProfileList request")
+	defer log.V(2).Info("Finished GetProfileList request")
+
+	certzMu.Lock()
+	defer certzMu.Unlock()
+
+	profileIDs := make([]string, 0, len(srv.profiles))
+	for ID := range srv.profiles {
+		profileIDs = append(profileIDs, ID)
+	}
+	slices.Sort(profileIDs)
+
+	return &certz.GetProfileListResponse{
+		SslProfileIds: profileIDs,
+	}, nil
 }
 func (srv *GNSICertzServer) CanGenerateCSR(ctx context.Context, req *certz.CanGenerateCSRRequest) (*certz.CanGenerateCSRResponse, error) {
 	if req.GetParams().GetCommonName() == "" {
@@ -221,6 +346,100 @@ func (srv *GNSICertzServer) bootstrapDefaultProfile() *profile {
 	}
 }
 
+func resolveSymlinkTarget(linkPath string) string {
+	if cp, err := filepath.EvalSymlinks(linkPath); err == nil {
+		return cp
+	}
+	if _, err := os.Lstat(linkPath); os.IsNotExist(err) {
+		return ""
+	}
+	if resolved := traverseSymlink(linkPath); resolved != linkPath {
+		return resolved
+	}
+	return ""
+}
+
+func restoreCustomCA(profileID, link, persistPath string) string {
+	if _, err := os.Stat(persistPath); err == nil {
+		log.V(2).Infof("Restoring CA from persistent file: %s", persistPath)
+		return persistPath
+	}
+	if realPath, err := filepath.EvalSymlinks(link); err == nil {
+		log.V(2).Infof("Restoring CA from symlink target: %s", realPath)
+		return realPath
+	}
+	log.V(1).Infof("No CA found in persistent path for profile %s", profileID)
+	return ""
+}
+
+func (srv *GNSICertzServer) restoreCustomProfile(profileID string) *profile {
+	log.V(2).Infof("Restoring custom profile: %s", profileID)
+	timeNow := uint64(time.Now().Unix())
+
+	paths := getLinkPaths(srv.config, profileID)
+	persistPath := filepath.Join(persistentProfilesDir, profileID, "ca")
+	caPath := restoreCustomCA(profileID, paths.CA, persistPath)
+	p := &profile{
+		ID: profileID,
+		ActiveEntities: entityGroup{
+			Cert: &genericEntity{
+				EType:     certType,
+				CreatedOn: timeNow,
+				Version:   defaultVersion,
+				CertPath:  resolveSymlinkTarget(paths.Cert),
+				KeyPath:   resolveSymlinkTarget(paths.Key),
+				Final:     true,
+			},
+			TrustBundle: &genericEntity{
+				EType:     tbType,
+				CreatedOn: timeNow,
+				Version:   defaultVersion,
+				CertPath:  caPath,
+				Final:     true,
+			},
+			CrlBundle: &genericEntity{
+				EType:     crlType,
+				CreatedOn: timeNow,
+				Version:   defaultVersion,
+				CertPath:  paths.CRL,
+				Final:     true,
+			},
+			AuthPolicy: &genericEntity{
+				EType:     apType,
+				CreatedOn: timeNow,
+				Version:   defaultVersion,
+				Final:     true,
+			},
+		},
+	}
+	p.LastEntities = entityGroup{}
+	return p
+}
+
+func (srv *GNSICertzServer) restoreCustomProfiles() {
+	log.V(2).Info("Restoring custom profiles from persistent storage")
+	files, err := os.ReadDir(persistentProfilesDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		log.V(1).Infof("Failed to read persistent profiles dir: %v", err)
+		return
+	}
+	for _, f := range files {
+		if !f.IsDir() {
+			continue
+		}
+		profileID := f.Name()
+		if profileID == defaultProfile {
+			continue
+		}
+		if _, ok := srv.profiles[profileID]; !ok {
+			srv.profiles[profileID] = srv.restoreCustomProfile(profileID)
+		}
+	}
+}
+
 // Rotate implements corresponding RPC.
 func (srv *GNSICertzServer) Rotate(stream certz.Certz_RotateServer) error {
 	ctx := stream.Context()
@@ -267,6 +486,9 @@ func (srv *GNSICertzServer) Rotate(stream certz.Certz_RotateServer) error {
 			profileId = defaultProfile
 			if reqID := req.GetSslProfileId(); reqID != "" {
 				profileId = reqID
+			}
+			if profileId != defaultProfile {
+				srv.sslProfileCheckpoint(ssc.CredzCPCreate, profileId)
 			}
 		}
 		log.V(2).Infof("[%v]gNSI: Rotating profile: %s", session, profileId)
@@ -434,20 +656,23 @@ func (srv *GNSICertzServer) newGenericEntity(eType CertzType, profileID string, 
 	keyPath := ""
 	certPath := ""
 	t := time.Now().UnixNano()
+
+	paths := getLinkPaths(srv.config, profileID)
+	certLnkDir := filepath.Dir(paths.Cert)
+	keyLnkDir := filepath.Dir(paths.Key)
+	caLnkDir := filepath.Dir(paths.CA)
+
 	switch eType {
 	case certType:
-		// This filepath Dir is based on default profile
-		certPath = fmt.Sprintf("%v/%v_%v_%d_cert.pem", filepath.Dir(srv.config.SrvCertLnk), profileID, ver, t)
-		keyPath = fmt.Sprintf("%v/%v_%v_%d_key.pem", filepath.Dir(srv.config.SrvKeyLnk), profileID, ver, t)
+		certPath = fmt.Sprintf("%v/%v_%v_%d_cert.pem", certLnkDir, profileID, ver, t)
+		keyPath = fmt.Sprintf("%v/%v_%v_%d_key.pem", keyLnkDir, profileID, ver, t)
 	case tbType:
-		certPath = fmt.Sprintf("%v/ca_%v_%v_%d_bundle.pem", filepath.Dir(srv.config.CaCertLnk), profileID, ver, t)
+		certPath = fmt.Sprintf("%v/ca_%v_%v_%d_bundle.pem", caLnkDir, profileID, ver, t)
 	case crlType:
-		// translate from v0 to v1 defaults
-		crlTranslate := profileID
-		if crlTranslate == defaultProfile {
-			crlTranslate = crlDefault
+		certPath = paths.CRL
+		if err := os.MkdirAll(certPath, 0777); err != nil {
+			log.V(1).Infof("Failed creating CRL dir: %v", certPath)
 		}
-		certPath = filepath.Join(srv.config.CertCRLConfig, crlTranslate)
 	case apType:
 		certPath = srv.config.FedPolicyFile
 	}
@@ -469,7 +694,7 @@ func (srv *GNSICertzServer) activateEntity(profileID string, entity *genericEnti
 	log.V(2).Infof("Activating: %+v", entity)
 	switch entity.EType {
 	case certType:
-		if err := atomicSetSrvCertKeyPair(srv.config, entity.CertPath, entity.KeyPath); err != nil {
+		if err := atomicSetSrvCertKeyPair(srv.config, profileID, entity.CertPath, entity.KeyPath); err != nil {
 			return err
 		}
 		if profile.ActiveEntities.Cert != nil && profile.ActiveEntities.Cert.Final {
@@ -478,7 +703,7 @@ func (srv *GNSICertzServer) activateEntity(profileID string, entity *genericEnti
 		profile.ActiveEntities.Cert = entity
 
 	case tbType:
-		if err := atomicSetCACert(srv.config, entity.CertPath); err != nil {
+		if err := atomicSetCACert(srv.config, profileID, entity.CertPath); err != nil {
 			return err
 		}
 		if profile.ActiveEntities.TrustBundle != nil && profile.ActiveEntities.TrustBundle.Final {
@@ -527,7 +752,22 @@ func (srv *GNSICertzServer) saveEntities(profileID string, entityMsg *certz.Enti
 		if len(bundle) == 0 {
 			return status.Errorf(codes.InvalidArgument, "trustBundle cannot be empty")
 		}
-		return attemptWrite(expEntity.CertPath, bundle, 0600)
+		if err := attemptWrite(expEntity.CertPath, bundle, 0600); err != nil {
+			return err
+		}
+		if profileID != defaultProfile {
+			persistDir := filepath.Join(persistentProfilesDir, profileID)
+			if err := os.MkdirAll(persistDir, 0755); err != nil {
+				log.V(1).Infof("Failed to create persist dir: %v", err)
+			} else {
+				persistPath := filepath.Join(persistDir, "ca")
+				log.V(2).Infof("Persisting TrustBundle to %s", persistPath)
+				if err := attemptWrite(persistPath, bundle, 0600); err != nil {
+					log.V(1).Infof("Failed to persist TrustBundle: %v", err)
+				}
+			}
+		}
+		return nil
 	case crlType:
 		if err := rotateCRLBundle(entityMsg.GetCertificateRevocationListBundle(), expEntity.CertPath); err != nil {
 			return status.Errorf(codes.Aborted, "%s", err.Error())
@@ -603,44 +843,64 @@ func (srv *GNSICertzServer) revertProfile(profileID string) {
 		log.V(2).Infof("No profile to revert: %v", profileID)
 		return
 	}
-	if profile.ActiveEntities.Cert.Final == false {
+	muPath.Lock()
+	if profile.ActiveEntities.Cert != nil && !profile.ActiveEntities.Cert.Final {
 		log.V(2).Info("Rollback Cert")
-		if err := atomicSetSrvCertKeyPair(srv.config, profile.LastEntities.Cert.CertPath, profile.LastEntities.Cert.KeyPath); err != nil {
-			log.V(0).Infof("Failed to revert certificate files: %e", err)
+		rollbackCert := ""
+		rollbackKey := ""
+		if profile.LastEntities.Cert != nil {
+			rollbackCert = profile.LastEntities.Cert.CertPath
+			rollbackKey = profile.LastEntities.Cert.KeyPath
 		}
-		writeEntityFreshness(profileID, profile.LastEntities.Cert)
-		removeEntityFiles(profile.ActiveEntities.Cert)
-		profile.ActiveEntities.Cert = profile.LastEntities.Cert
+		if err := atomicSetSrvCertKeyPair(srv.config, profileID, rollbackCert, rollbackKey); err != nil {
+			log.V(0).Infof("Failed to revert certificate files: %v", err)
+		}
+		if profile.LastEntities.Cert != nil {
+			writeEntityFreshness(profileID, profile.LastEntities.Cert)
+			srv.removeEntityFiles(profile.ActiveEntities.Cert)
+			profile.ActiveEntities.Cert = profile.LastEntities.Cert
+		}
 	}
-	if profile.ActiveEntities.TrustBundle.Final == false {
+	if profile.ActiveEntities.TrustBundle != nil && !profile.ActiveEntities.TrustBundle.Final {
 		log.V(2).Info("Rollback TB")
-		if err := atomicSetCACert(srv.config, profile.LastEntities.TrustBundle.CertPath); err != nil {
-			log.V(0).Infof("Failed to revert trust bundle file: %e", err)
+		rollbackCA := ""
+		if profile.LastEntities.TrustBundle != nil {
+			rollbackCA = profile.LastEntities.TrustBundle.CertPath
 		}
-		writeEntityFreshness(profileID, profile.LastEntities.TrustBundle)
-		removeEntityFiles(profile.ActiveEntities.TrustBundle)
-		profile.ActiveEntities.TrustBundle = profile.LastEntities.TrustBundle
+		if err := atomicSetCACert(srv.config, profileID, rollbackCA); err != nil {
+			log.V(0).Infof("Failed to revert trust bundle file: %v", err)
+		}
+		if profile.LastEntities.TrustBundle != nil {
+			writeEntityFreshness(profileID, profile.LastEntities.TrustBundle)
+			srv.removeEntityFiles(profile.ActiveEntities.TrustBundle)
+			profile.ActiveEntities.TrustBundle = profile.LastEntities.TrustBundle
+		}
 	}
-	if profile.ActiveEntities.CrlBundle.Final == false {
+	if profile.ActiveEntities.CrlBundle != nil && !profile.ActiveEntities.CrlBundle.Final {
 		log.V(2).Info("Rollback CRL")
-		// translate from v0 to v1 defaults
-		crlTranslate := profileID
-		if crlTranslate == defaultProfile {
-			crlTranslate = crlDefault
-		}
-		path := filepath.Join(srv.config.CertCRLConfig, crlTranslate)
+		path := getLinkPaths(srv.config, profileID).CRL
 		copyCRLBundle(path+crlFlush, path)
-		writeEntityFreshness(profileID, profile.LastEntities.CrlBundle)
-		profile.ActiveEntities.CrlBundle = profile.LastEntities.CrlBundle
+		if profile.LastEntities.CrlBundle != nil {
+			writeEntityFreshness(profileID, profile.LastEntities.CrlBundle)
+			profile.ActiveEntities.CrlBundle = profile.LastEntities.CrlBundle
+		}
 	}
-	if profile.ActiveEntities.AuthPolicy.Final == false {
+	if profile.ActiveEntities.AuthPolicy != nil && !profile.ActiveEntities.AuthPolicy.Final {
 		log.V(2).Info("Rollback AP")
 		if err := os.Rename(profile.ActiveEntities.AuthPolicy.CertPath+backupExt, profile.ActiveEntities.AuthPolicy.CertPath); err != nil {
 			log.V(0).Infof("Failed to revert Auth Policy: %v", err)
 		}
-		writeEntityFreshness(profileID, profile.LastEntities.AuthPolicy)
-		profile.ActiveEntities.AuthPolicy = profile.LastEntities.AuthPolicy
+		if profile.LastEntities.AuthPolicy != nil {
+			writeEntityFreshness(profileID, profile.LastEntities.AuthPolicy)
+			profile.ActiveEntities.AuthPolicy = profile.LastEntities.AuthPolicy
+		}
 	}
+	if err := saveCertzMetadata(srv.config.CertzMetaFile, srv.profiles); err != nil {
+		log.V(0).Infof("Failed to save certz metadata after revert: %v", err)
+	}
+	muPath.Unlock()
+	srv.sslProfileCheckpoint(ssc.CredzCPRestore, profileID)
+	srv.sslProfileCheckpoint(ssc.CredzCPDelete, profileID)
 }
 
 func (srv *GNSICertzServer) finalizeProfile(profileID string) error {
@@ -649,31 +909,26 @@ func (srv *GNSICertzServer) finalizeProfile(profileID string) error {
 	if !ok || profile == nil {
 		return status.Errorf(codes.InvalidArgument, "Finalize requested with invalid ssl_profile_id: %s", profileID)
 	}
-	if profile.ActiveEntities.Cert.Final != true {
-		removeEntityFiles(profile.LastEntities.Cert)
+	if profile.ActiveEntities.Cert != nil && !profile.ActiveEntities.Cert.Final {
+		srv.removeEntityFiles(profile.LastEntities.Cert)
 		profile.ActiveEntities.Cert.Final = true
 	}
 	profile.LastEntities.Cert = profile.ActiveEntities.Cert
 
-	if profile.ActiveEntities.TrustBundle.Final != true {
-		removeEntityFiles(profile.LastEntities.TrustBundle)
+	if profile.ActiveEntities.TrustBundle != nil && !profile.ActiveEntities.TrustBundle.Final {
+		srv.removeEntityFiles(profile.LastEntities.TrustBundle)
 		profile.ActiveEntities.TrustBundle.Final = true
 	}
 	profile.LastEntities.TrustBundle = profile.ActiveEntities.TrustBundle
 
-	if profile.ActiveEntities.CrlBundle.Final == false {
-		// translate from v0 to v1 defaults
-		crlTranslate := profileID
-		if crlTranslate == defaultProfile {
-			crlTranslate = crlDefault
-		}
-		path := filepath.Join(srv.config.CertCRLConfig, crlTranslate)
+	if profile.ActiveEntities.CrlBundle != nil && !profile.ActiveEntities.CrlBundle.Final {
+		path := getLinkPaths(srv.config, profileID).CRL
 		copyCRLBundle(path, path+crlFlush)
 		profile.ActiveEntities.CrlBundle.Final = true
 		profile.LastEntities.CrlBundle = profile.ActiveEntities.CrlBundle
 	}
 
-	if profile.ActiveEntities.AuthPolicy.Final != true {
+	if profile.ActiveEntities.AuthPolicy != nil && !profile.ActiveEntities.AuthPolicy.Final {
 		log.V(2).Info("Finalize AP")
 		if err := os.Remove(profile.ActiveEntities.AuthPolicy.CertPath + backupExt); err != nil {
 			log.V(1).Infof("Auth Policy backup was lost: %v", err)
@@ -682,10 +937,23 @@ func (srv *GNSICertzServer) finalizeProfile(profileID string) error {
 	}
 	profile.LastEntities.AuthPolicy = profile.ActiveEntities.AuthPolicy
 
-	return saveCertzMetadata(srv.config.CertzMetaFile, srv.profiles)
+	if err := saveCertzMetadata(srv.config.CertzMetaFile, srv.profiles); err != nil {
+		return err
+	}
+
+	// Stage host-readable PEMs via host-services ssl_profile. Failure is
+	// logged, not fatal: Certz has already stored the profile, and consumers
+	// bind the id from CONFIG_DB (syslog uses SYSLOG_SERVER.tls_profile_id).
+	srv.installSslProfile(profileID)
+	srv.sslProfileCheckpoint(ssc.CredzCPDelete, profileID)
+	return nil
 }
 
 func writeEntityFreshness(profileID string, entity *genericEntity) {
+	if entity == nil {
+		log.V(2).Infof("Skipping db write for empty entity in profile %s", profileID)
+		return
+	}
 	log.V(2).Infof("Writing %s profile to DB: %+v", profileID, entity)
 	var vFld string
 	var cFld string
@@ -747,19 +1015,21 @@ func validateProfileExists(profile profile) error {
 	if profile.ID == "" {
 		return status.Errorf(codes.NotFound, "cannot validate empty profile")
 	}
-	// Cert Paths
-	if _, err := os.Lstat(profile.ActiveEntities.Cert.CertPath); os.IsNotExist(err) {
-		return status.Errorf(codes.NotFound, "Cert '%v': '%v' does not exist", profile.ID, profile.ActiveEntities.Cert.CertPath)
+	if profile.ActiveEntities.Cert != nil && profile.ActiveEntities.Cert.CertPath != "" {
+		if _, err := os.Lstat(profile.ActiveEntities.Cert.CertPath); os.IsNotExist(err) {
+			return status.Errorf(codes.NotFound, "Cert '%v': '%v' does not exist", profile.ID, profile.ActiveEntities.Cert.CertPath)
+		}
 	}
-	if _, err := os.Lstat(profile.ActiveEntities.Cert.KeyPath); os.IsNotExist(err) {
-		return status.Errorf(codes.NotFound, "Key '%v': '%v' does not exist", profile.ID, profile.ActiveEntities.Cert.KeyPath)
+	if profile.ActiveEntities.Cert != nil && profile.ActiveEntities.Cert.KeyPath != "" {
+		if _, err := os.Lstat(profile.ActiveEntities.Cert.KeyPath); os.IsNotExist(err) {
+			return status.Errorf(codes.NotFound, "Key '%v': '%v' does not exist", profile.ID, profile.ActiveEntities.Cert.KeyPath)
+		}
 	}
-	// Trust Bundle Path
-	if _, err := os.Lstat(profile.ActiveEntities.TrustBundle.CertPath); os.IsNotExist(err) {
-		return status.Errorf(codes.NotFound, "TB '%v': '%v' does not exist", profile.ID, profile.ActiveEntities.TrustBundle.CertPath)
+	if profile.ActiveEntities.TrustBundle != nil && profile.ActiveEntities.TrustBundle.CertPath != "" {
+		if _, err := os.Lstat(profile.ActiveEntities.TrustBundle.CertPath); os.IsNotExist(err) {
+			return status.Errorf(codes.NotFound, "TB '%v': '%v' does not exist", profile.ID, profile.ActiveEntities.TrustBundle.CertPath)
+		}
 	}
-	// CRL Path - nothing needed
-	// Auth Policy Path - nothing needed
 	return nil
 }
 
@@ -770,19 +1040,19 @@ func (srv *GNSICertzServer) entityAlreadyActive(profileID string, entity *generi
 	}
 	switch entity.EType {
 	case certType:
-		if entity.Version == profile.ActiveEntities.Cert.Version {
+		if profile.ActiveEntities.Cert != nil && entity.Version == profile.ActiveEntities.Cert.Version {
 			return status.Errorf(codes.AlreadyExists, "%s with profile=`%s` and version=`%v` already exists", entity.EType, profileID, entity.Version)
 		}
 	case tbType:
-		if entity.Version == profile.ActiveEntities.TrustBundle.Version {
+		if profile.ActiveEntities.TrustBundle != nil && entity.Version == profile.ActiveEntities.TrustBundle.Version {
 			return status.Errorf(codes.AlreadyExists, "%s with profile=`%s` and version=`%v` already exists", entity.EType, profileID, entity.Version)
 		}
 	case crlType:
-		if entity.Version == profile.ActiveEntities.CrlBundle.Version {
+		if profile.ActiveEntities.CrlBundle != nil && entity.Version == profile.ActiveEntities.CrlBundle.Version {
 			return status.Errorf(codes.AlreadyExists, "%s with profile=`%s` and version=`%v` already exists", entity.EType, profileID, entity.Version)
 		}
 	case apType:
-		if entity.Version == profile.ActiveEntities.AuthPolicy.Version {
+		if profile.ActiveEntities.AuthPolicy != nil && entity.Version == profile.ActiveEntities.AuthPolicy.Version {
 			return status.Errorf(codes.AlreadyExists, "%s with profile=`%s` and version=`%v` already exists", entity.EType, profileID, entity.Version)
 		}
 	}
@@ -952,11 +1222,77 @@ func symlinkPointsToRotation(link string) bool {
 	return true
 }
 
-// atomicSetSrvCertKeyPair atomically replaces server's private key and certificate.
-func atomicSetSrvCertKeyPair(cfg *Config, sCert, sKey string) error {
+type profilePaths struct {
+	Cert string
+	Key  string
+	CA   string
+	CRL  string
+}
+
+func getLinkPaths(cfg *Config, profileID string) profilePaths {
+	switch profileID {
+	case defaultProfile:
+		crlPath := filepath.Join(cfg.CertCRLConfig, crlDefault)
+		return profilePaths{
+			Cert: cfg.SrvCertLnk,
+			Key:  cfg.SrvKeyLnk,
+			CA:   cfg.CaCertLnk,
+			CRL:  crlPath,
+		}
+	default:
+		baseDir := filepath.Dir(cfg.SrvCertLnk)
+		base := filepath.Join(baseDir, certzProfilesDir, profileID)
+		return profilePaths{
+			Cert: filepath.Join(base, "cert"),
+			Key:  filepath.Join(base, "key"),
+			CA:   filepath.Join(base, "ca"),
+			CRL:  filepath.Join(base, "crl"),
+		}
+	}
+}
+
+func traverseSymlink(path string) string {
+	current := path
+	for i := 0; i < 255; i++ {
+		fi, err := os.Lstat(current)
+		if err != nil {
+			return current
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			return current
+		}
+		target, err := os.Readlink(current)
+		if err != nil {
+			return current
+		}
+		if !filepath.IsAbs(target) {
+			current = filepath.Join(filepath.Dir(current), target)
+		} else {
+			current = target
+		}
+	}
+	return current
+}
+
+// atomicSetSrvCertKeyPair atomically replaces the cert/key pair for the given
+// profile. gnxi retargets the telemetry listener; other IDs use
+// certz_profiles/<id>/{cert,key} so custom-profile rotation does not swap gNMI certs.
+func atomicSetSrvCertKeyPair(cfg *Config, profileID, sCert, sKey string) error {
 	// NOTE: muPath has to be writer-locked when entering this function.
-	// This assumes default profile and needs to be replaced when multi-profile is supported
-	log.V(2).Infof("Attempting to set Cert: %s", sCert)
+	log.V(2).Infof("Attempting to set Cert: %s for profile %s", sCert, profileID)
+	if sCert == "" || sKey == "" {
+		log.V(1).Infof("Empty cert or key path for profile %s; deleting active symlinks", profileID)
+		paths := getLinkPaths(cfg, profileID)
+		_, _ = rmSymlink(paths.Cert)
+		_, _ = rmSymlink(paths.Key)
+		return nil
+	}
+	paths := getLinkPaths(cfg, profileID)
+	certLnk, keyLnk := paths.Cert, paths.Key
+	if err := os.MkdirAll(filepath.Dir(certLnk), 0755); err != nil {
+		return err
+	}
+
 	cert, err := filepath.Abs(sCert)
 	if err != nil {
 		return err
@@ -965,57 +1301,54 @@ func atomicSetSrvCertKeyPair(cfg *Config, sCert, sKey string) error {
 	if err != nil {
 		return err
 	}
-	// Remove the old symlink to server's certificate.
-	oldCert, err := rmSymlink(cfg.SrvCertLnk)
+	oldCert, err := rmSymlink(certLnk)
 	if err != nil {
 		return err
 	}
-	// Remove the old symlink to server's private key .
-	oldKey, err := rmSymlink(cfg.SrvKeyLnk)
+	oldKey, err := rmSymlink(keyLnk)
 	if err != nil {
-		_ = restoreSymlink(oldCert, cfg.SrvCertLnk)
+		_ = restoreSymlink(oldCert, certLnk)
 		return err
 	}
-	// Create new symbolic link to new certificate.
-	if err := os.Symlink(cert, cfg.SrvCertLnk); err != nil {
-		// Ignore the following errors as they are secondary and report the problem with creating the new symlink.
-		_ = restoreSymlink(oldCert, cfg.SrvCertLnk)
-		_ = restoreSymlink(oldKey, cfg.SrvKeyLnk)
+	if err := os.Symlink(cert, certLnk); err != nil {
+		_ = restoreSymlink(oldCert, certLnk)
+		_ = restoreSymlink(oldKey, keyLnk)
 		return err
 	}
-	// Create new symbolic link to new private key.
-	if err := os.Symlink(key, cfg.SrvKeyLnk); err != nil {
-		// Ignore the following errors as they are secondary and report the problem with creating the new symlink.
-		_ = restoreSymlink(oldCert, cfg.SrvCertLnk)
-		_ = restoreSymlink(oldKey, cfg.SrvKeyLnk)
+	if err := os.Symlink(key, keyLnk); err != nil {
+		_ = restoreSymlink(oldCert, certLnk)
+		_ = restoreSymlink(oldKey, keyLnk)
 		return err
 	}
-	log.V(2).Infof("Succesful Set Cert: %s", sCert)
+	log.V(2).Infof("Successful Set Cert: %s for profile %s", sCert, profileID)
 	return nil
 }
 
-// atomicSetCACert atomically replaces CA's certificate.
-// trustBundle is the CA
-func atomicSetCACert(cfg *Config, caCert string) error {
+// atomicSetCACert atomically replaces the CA certificate for the given profile.
+func atomicSetCACert(cfg *Config, profileID, caCert string) error {
 	// NOTE: muPath has to be writer-locked when entering this function.
-	// This assumes default profile and needs to be replaced when multi-profile is supported
-	log.V(2).Infof("Attempt Set CA: %s", caCert)
+	log.V(2).Infof("Attempt Set CA: %s for profile %s", caCert, profileID)
+	caLnk := getLinkPaths(cfg, profileID).CA
+	if err := os.MkdirAll(filepath.Dir(caLnk), 0755); err != nil {
+		return err
+	}
+	if caCert == "" {
+		_, _ = rmSymlink(caLnk)
+		return nil
+	}
 	cert, err := filepath.Abs(caCert)
 	if err != nil {
 		return err
 	}
-	// Remove the old symlink to CA's certificate.
-	oldCert, err := rmSymlink(cfg.CaCertLnk)
+	oldCert, err := rmSymlink(caLnk)
 	if err != nil {
 		return err
 	}
-	// Create new symbolic link to new certificate.
-	if err := os.Symlink(cert, cfg.CaCertLnk); err != nil {
-		// Ignore the following error as it is secondary and report the problem with creating the new symlink.
-		_ = restoreSymlink(oldCert, cfg.CaCertLnk)
+	if err := os.Symlink(cert, caLnk); err != nil {
+		_ = restoreSymlink(oldCert, caLnk)
 		return err
 	}
-	log.V(2).Infof("Succesful Set CA: %s", caCert)
+	log.V(2).Infof("Successful Set CA: %s for profile %s", caCert, profileID)
 	return nil
 }
 
@@ -1045,21 +1378,47 @@ func attemptWrite(name string, data []byte, perm os.FileMode) error {
 	return err
 }
 
-func removeEntityFiles(e *genericEntity) {
+func (srv *GNSICertzServer) removeEntityFiles(e *genericEntity) {
+	if e == nil || srv.config == nil {
+		return
+	}
+
+	isManagedFilePath := func(path string) bool {
+		if path == "" {
+			return false
+		}
+		dir := filepath.Dir(path)
+		baseDir := filepath.Dir(srv.config.SrvCertLnk)
+		if dir != baseDir && !strings.HasPrefix(dir, filepath.Join(baseDir, certzProfilesDir)+string(os.PathSeparator)) {
+			return false
+		}
+		if path == srv.config.SrvCertFile || path == srv.config.SrvKeyFile || path == srv.config.CaCertFile {
+			return false
+		}
+		pattern := `^(ca_)?[a-zA-Z0-9._-]+_.*_[0-9]+_(cert|key|bundle)\.pem$`
+		matched, _ := regexp.MatchString(pattern, filepath.Base(path))
+		return matched
+	}
+
+	var pathsToRemove []string
 	switch e.EType {
 	case certType:
-		log.V(2).Infof("Removing Cert: %s", e.CertPath)
-		if err := os.Remove(e.CertPath); err != nil {
-			log.V(1).Infof("Removing Cert failed: %s", err)
+		if isManagedFilePath(e.CertPath) {
+			pathsToRemove = append(pathsToRemove, e.CertPath)
 		}
-		log.V(2).Infof("Removing Key: %s", e.KeyPath)
-		if err := os.Remove(e.KeyPath); err != nil {
-			log.V(1).Infof("Removing Key failed: %s", err)
+		if isManagedFilePath(e.KeyPath) {
+			pathsToRemove = append(pathsToRemove, e.KeyPath)
 		}
 	case tbType:
-		log.V(2).Infof("Removing TrustBundle: %s", e.CertPath)
-		if err := os.Remove(e.CertPath); err != nil {
-			log.V(1).Infof("Removing TrustBundle failed: %s", err)
+		if isManagedFilePath(e.CertPath) {
+			pathsToRemove = append(pathsToRemove, e.CertPath)
+		}
+	}
+
+	for _, p := range pathsToRemove {
+		log.V(2).Infof("Removing profile-managed file: %s", p)
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.V(1).Infof("Failed to remove: %s", err)
 		}
 	}
 }
@@ -1087,6 +1446,89 @@ func writeCredentialsMetadataToDB(tbl, key, fld, val string) error {
 	}
 	log.V(3).Infof("Successfully wrote credentials metadata to the DB. [path:'%v', fld:'%v', val:'%v']", path, fld, val)
 	return nil
+}
+
+func deleteCredentialsMetadataFromDB(tbl, key string) error {
+	sc, err := common_utils.GetRedisDBClient()
+	if err != nil {
+		log.V(0).Info(err.Error())
+		return fmt.Errorf("REDIS is not available: %v", err)
+	}
+	defer sc.Close()
+
+	path := common_utils.GetKey([]string{credentialsTbl, tbl})
+	if len(key) > 0 {
+		path = common_utils.GetKey([]string{path, key})
+	}
+	dbWriteMutex.Lock()
+	err = sc.Del(context.Background(), path).Err()
+	dbWriteMutex.Unlock()
+	if err != nil {
+		log.V(0).Infof("Cannot delete credentials metadata from the DB. [path:'%v']", path)
+		return err
+	}
+	log.V(3).Infof("Successfully deleted credentials metadata from the DB. [path:'%v']", path)
+	return nil
+}
+
+func (srv *GNSICertzServer) sslProfileCheckpoint(action ssc.CredzCheckpointAction, profileID string) {
+	if profileID == "" || profileID == defaultProfile {
+		return
+	}
+	sc, err := ssc.NewDbusClientProvider()
+	if err != nil {
+		log.V(1).Infof("ssl_profile checkpoint %s: dbus client: %v", action, err)
+		return
+	}
+	defer sc.Close()
+	if err := sc.SslProfileCheckpoint(action, profileID); err != nil {
+		log.V(1).Infof("ssl_profile checkpoint %s for %q failed: %v", action, profileID, err)
+	}
+}
+
+func (srv *GNSICertzServer) installSslProfile(profileID string) {
+	if profileID == "" || profileID == defaultProfile {
+		return
+	}
+	p, ok := srv.profiles[profileID]
+	if !ok || p == nil {
+		return
+	}
+	certSrc, keySrc, caSrc := "", "", ""
+	if p.ActiveEntities.Cert != nil {
+		certSrc = p.ActiveEntities.Cert.CertPath
+		keySrc = p.ActiveEntities.Cert.KeyPath
+	}
+	if p.ActiveEntities.TrustBundle != nil {
+		caSrc = p.ActiveEntities.TrustBundle.CertPath
+	}
+	if certSrc == "" && keySrc == "" && caSrc == "" {
+		return
+	}
+	sc, err := ssc.NewDbusClientProvider()
+	if err != nil {
+		log.V(1).Infof("ssl_profile install_profile: dbus client: %v", err)
+		return
+	}
+	defer sc.Close()
+	if err := sc.InstallSslProfile(profileID, certSrc, keySrc, caSrc); err != nil {
+		log.V(1).Infof("ssl_profile install_profile for %q failed: %v", profileID, err)
+	}
+}
+
+func (srv *GNSICertzServer) deleteSslProfile(profileID string) {
+	if profileID == "" || profileID == defaultProfile {
+		return
+	}
+	sc, err := ssc.NewDbusClientProvider()
+	if err != nil {
+		log.V(1).Infof("ssl_profile delete_profile: dbus client: %v", err)
+		return
+	}
+	defer sc.Close()
+	if err := sc.DeleteSslProfile(profileID); err != nil {
+		log.V(1).Infof("ssl_profile delete_profile for %q failed: %v", profileID, err)
+	}
 }
 
 func parseCSRSuite(suite certz.CSRSuite) (int, x509.SignatureAlgorithm) {

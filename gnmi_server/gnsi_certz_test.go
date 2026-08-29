@@ -15,6 +15,7 @@ import (
 
 	log "github.com/golang/glog"
 	certz "github.com/openconfig/gnsi/certz"
+	ssc "github.com/sonic-net/sonic-gnmi/sonic_service_client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -705,26 +706,219 @@ var gnsiCertzTestCases = []struct {
 		},
 	},
 	{
-		desc: "AddProfileUnimplemented",
+		desc: "AddProfileSuccessAndDupError",
 		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
-			if _, err := sc.AddProfile(ctx, &certz.AddProfileRequest{}, grpc.EmptyCallOption{}); err != nil && status.Code(err) != codes.Unimplemented {
-				t.Error("Expected Unimplemented Error")
+			_, err := sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: "custom-test-1"}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to add custom profile: %v", err)
+			}
+			_, err = sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: "custom-test-1"}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.AlreadyExists {
+				t.Fatalf("Expected AlreadyExists code for duplicate profile registration, got: %v", err)
 			}
 		},
 	},
 	{
-		desc: "DeleteProfileUnimplemented",
+		desc: "AddProfileSaveMetadataFailure",
 		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
-			if _, err := sc.DeleteProfile(ctx, &certz.DeleteProfileRequest{}, grpc.EmptyCallOption{}); err != nil && status.Code(err) != codes.Unimplemented {
-				t.Error("Expected Unimplemented Error")
+			origMetaFile := s.config.CertzMetaFile
+			s.config.CertzMetaFile = t.TempDir()
+			defer func() { s.config.CertzMetaFile = origMetaFile }()
+
+			_, err := sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: "custom-test-fail"}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.Internal {
+				t.Fatalf("Expected Internal error when saving metadata fails, got: %v", err)
+			}
+
+			resp, err := sc.GetProfileList(ctx, &certz.GetProfileListRequest{}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to get profile list: %v", err)
+			}
+			for _, id := range resp.GetSslProfileIds() {
+				if id == "custom-test-fail" {
+					t.Error("Profile was added despite save failure")
+				}
 			}
 		},
 	},
 	{
-		desc: "GetProfileListUnimplemented",
+		desc: "AddProfileInvalidID",
 		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
-			if _, err := sc.GetProfileList(ctx, &certz.GetProfileListRequest{}, grpc.EmptyCallOption{}); err != nil && status.Code(err) != codes.Unimplemented {
-				t.Error("Expected Unimplemented Error")
+			_, err := sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: "invalid/id"}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("Expected InvalidArgument when adding invalid profile ID, got: %v", err)
+			}
+		},
+	},
+	{
+		desc: "AddProfileEmptyID",
+		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
+			_, err := sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: ""}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("Expected InvalidArgument when adding empty profile ID, got: %v", err)
+			}
+		},
+	},
+	{
+		desc: "DeleteProfileSuccessAndErrors",
+		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
+			_, err := sc.DeleteProfile(ctx, &certz.DeleteProfileRequest{SslProfileId: "gnxi"}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("Expected InvalidArgument when deleting default profile, got: %v", err)
+			}
+			_, err = sc.DeleteProfile(ctx, &certz.DeleteProfileRequest{SslProfileId: "nonexistent"}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.NotFound {
+				t.Fatalf("Expected NotFound when deleting nonexistent profile, got: %v", err)
+			}
+			_, err = sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: "custom-test-delete"}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to add custom profile: %v", err)
+			}
+			_, err = sc.DeleteProfile(ctx, &certz.DeleteProfileRequest{SslProfileId: "custom-test-delete"}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to delete custom profile: %v", err)
+			}
+		},
+	},
+	{
+		desc: "DeleteProfileEmptyID",
+		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
+			_, err := sc.DeleteProfile(ctx, &certz.DeleteProfileRequest{SslProfileId: ""}, grpc.EmptyCallOption{})
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("Expected InvalidArgument when deleting empty profile ID, got: %v", err)
+			}
+		},
+	},
+	{
+		desc: "GetProfileListSuccess",
+		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
+			_, err := sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: "custom-test-list"}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to add custom profile: %v", err)
+			}
+			resp, err := sc.GetProfileList(ctx, &certz.GetProfileListRequest{}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to get profile list: %v", err)
+			}
+			var foundGnxi, foundCustom bool
+			for _, id := range resp.GetSslProfileIds() {
+				if id == "gnxi" {
+					foundGnxi = true
+				}
+				if id == "custom-test-list" {
+					foundCustom = true
+				}
+			}
+			if !foundGnxi {
+				t.Error("Profile list did not contain default 'gnxi'")
+			}
+			if !foundCustom {
+				t.Error("Profile list did not contain added 'custom-test-list'")
+			}
+		},
+	},
+	{
+		desc: "RotateCertificateCustomProfileDoesNotSwapGnxi",
+		f: func(ctx context.Context, t *testing.T, sc certz.CertzClient, s *Server) {
+			profileID := "syslog"
+			_, err := sc.AddProfile(ctx, &certz.AddProfileRequest{SslProfileId: profileID}, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatalf("Failed to add syslog profile: %v", err)
+			}
+			defer sc.DeleteProfile(ctx, &certz.DeleteProfileRequest{SslProfileId: profileID}, grpc.EmptyCallOption{})
+
+			gnxiCertBefore, err := os.Readlink(s.config.SrvCertLnk)
+			if err != nil {
+				t.Fatalf("Failed to read gnxi cert link: %v", err)
+			}
+			gnxiKeyBefore, err := os.Readlink(s.config.SrvKeyLnk)
+			if err != nil {
+				t.Fatalf("Failed to read gnxi key link: %v", err)
+			}
+
+			stream, err := sc.Rotate(ctx, grpc.EmptyCallOption{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			ver := generateVersion()
+			certPem, err := os.ReadFile(GoldSCertV2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keyPem, err := os.ReadFile(GoldSKeyV2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = stream.Send(&certz.RotateCertificateRequest{
+				RotateRequest: &certz.RotateCertificateRequest_Certificates{
+					Certificates: &certz.UploadRequest{
+						Entities: []*certz.Entity{
+							{
+								Version:   ver,
+								CreatedOn: 123,
+								Entity: &certz.Entity_CertificateChain{
+									CertificateChain: &certz.CertificateChain{
+										Certificate: &certz.Certificate{
+											Type:        certz.CertificateType_CERTIFICATE_TYPE_X509,
+											Encoding:    certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM,
+											Certificate: certPem,
+											PrivateKey:  keyPem,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				SslProfileId: profileID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = stream.Recv(); err != nil {
+				t.Fatal(err)
+			}
+			if err = stream.Send(&certz.RotateCertificateRequest{
+				RotateRequest: &certz.RotateCertificateRequest_FinalizeRotation{},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			stream.CloseSend()
+			if _, err = stream.Recv(); err != io.EOF {
+				t.Fatalf("Expected EOF after finalize, got: %v", err)
+			}
+
+			gnxiCertAfter, err := os.Readlink(s.config.SrvCertLnk)
+			if err != nil {
+				t.Fatalf("Failed to read gnxi cert link after rotate: %v", err)
+			}
+			gnxiKeyAfter, err := os.Readlink(s.config.SrvKeyLnk)
+			if err != nil {
+				t.Fatalf("Failed to read gnxi key link after rotate: %v", err)
+			}
+			if gnxiCertAfter != gnxiCertBefore {
+				t.Errorf("Rotate(syslog) changed gnxi SrvCertLnk from %s to %s", gnxiCertBefore, gnxiCertAfter)
+			}
+			if gnxiKeyAfter != gnxiKeyBefore {
+				t.Errorf("Rotate(syslog) changed gnxi SrvKeyLnk from %s to %s", gnxiKeyBefore, gnxiKeyAfter)
+			}
+
+			baseDir := filepath.Join(filepath.Dir(s.config.SrvCertLnk), certzProfilesDir, profileID)
+			certLnk := filepath.Join(baseDir, "cert")
+			keyLnk := filepath.Join(baseDir, "key")
+			if _, err := os.Lstat(certLnk); os.IsNotExist(err) {
+				t.Errorf("syslog cert link %s does not exist", certLnk)
+			}
+			if _, err := os.Lstat(keyLnk); os.IsNotExist(err) {
+				t.Errorf("syslog key link %s does not exist", keyLnk)
+			}
+			target, err := os.Readlink(certLnk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(target, profileID) || !strings.Contains(target, ver) {
+				t.Errorf("syslog cert link target %s is not for profile %s version %s", target, profileID, ver)
 			}
 		},
 	},
@@ -1536,7 +1730,34 @@ var gnsiCertzTestCases = []struct {
 	},
 }
 
+func TestGetLinkPathsIsolatesCustomProfiles(t *testing.T) {
+	cfg := &Config{
+		SrvCertLnk:    "/keys/server_cert.lnk",
+		SrvKeyLnk:     "/keys/server_key.lnk",
+		CaCertLnk:     "/keys/ca_cert.lnk",
+		CertCRLConfig: "/keys/crls",
+	}
+	gnxi := getLinkPaths(cfg, defaultProfile)
+	if gnxi.Cert != cfg.SrvCertLnk || gnxi.Key != cfg.SrvKeyLnk || gnxi.CA != cfg.CaCertLnk {
+		t.Fatalf("gnxi paths should be the telemetry listener links, got %+v", gnxi)
+	}
+	syslog := getLinkPaths(cfg, "syslog")
+	if syslog.Cert == cfg.SrvCertLnk || syslog.Key == cfg.SrvKeyLnk || syslog.CA == cfg.CaCertLnk {
+		t.Fatalf("syslog paths must not reuse gnxi listener links: %+v", syslog)
+	}
+	wantPrefix := filepath.Join("/keys", certzProfilesDir, "syslog")
+	if syslog.Cert != filepath.Join(wantPrefix, "cert") || syslog.Key != filepath.Join(wantPrefix, "key") || syslog.CA != filepath.Join(wantPrefix, "ca") {
+		t.Fatalf("syslog paths = %+v, want under %s", syslog, wantPrefix)
+	}
+}
+
 func TestGnsiCertzServer(t *testing.T) {
+	origDbus := ssc.NewDbusClientProvider
+	ssc.NewDbusClientProvider = func() (ssc.Service, error) {
+		return &ssc.FakeClient{}, nil
+	}
+	defer func() { ssc.NewDbusClientProvider = origDbus }()
+
 	if err := os.MkdirAll(filepath.Join(crlConfigTestPath, "crl"), 0777); err != nil {
 		t.Fatalf("Failed Creating CRL Default dir: %v", err)
 	}
@@ -1570,6 +1791,7 @@ func TestGnsiCertzServer(t *testing.T) {
 		if err := cleanupCRLfiles(); err != nil {
 			t.Errorf("Failed to cleanup crl files: %v", err)
 		}
+		_ = os.RemoveAll(filepath.Join(filepath.Dir(s.config.SrvCertLnk), certzProfilesDir))
 	}()
 
 	if err := resetSrvCertKeyToV1(s.config); err != nil {
@@ -1663,7 +1885,7 @@ func resetSrvCertKeyToV1(cfg *Config) error {
 		fmt.Errorf("Printing resetGRPC error: %s", err)
 		return err
 	}
-	return atomicSetSrvCertKeyPair(cfg, SCertV1, SKeyV1)
+	return atomicSetSrvCertKeyPair(cfg, defaultProfile, SCertV1, SKeyV1)
 }
 
 func generateVersion() string {

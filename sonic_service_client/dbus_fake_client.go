@@ -102,3 +102,24 @@ func (f *FakeClient) GLOMERestoreCheckpoint(ctx context.Context) error {
 	f.Command <- []string{"glome" + string(CredzCPRestore), ""}
 	return nil
 }
+
+func (f *FakeClient) InstallSslProfile(profileID, certSrc, keySrc, caSrc string) error {
+	if f.Command != nil {
+		f.Command <- []string{"ssl_profile.install_profile", profileID, certSrc, keySrc, caSrc}
+	}
+	return nil
+}
+
+func (f *FakeClient) DeleteSslProfile(profileID string) error {
+	if f.Command != nil {
+		f.Command <- []string{"ssl_profile.delete_profile", profileID}
+	}
+	return nil
+}
+
+func (f *FakeClient) SslProfileCheckpoint(action CredzCheckpointAction, profileID string) error {
+	if f.Command != nil {
+		f.Command <- []string{"ssl_profile" + string(action), profileID}
+	}
+	return nil
+}

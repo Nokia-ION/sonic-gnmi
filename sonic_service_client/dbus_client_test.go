@@ -1302,3 +1302,51 @@ func TestConsoleCheckpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestSslProfileDbusMethods(t *testing.T) {
+	client := &DbusClient{
+		busNamePrefix: "org.SONiC.HostService.",
+		busPathPrefix: "/org/SONiC/HostService/",
+		intNamePrefix: "org.SONiC.HostService.",
+	}
+	originalDbusApi := dbusApiCaller
+	defer func() { dbusApiCaller = originalDbusApi }()
+
+	t.Run("InstallSslProfile", func(t *testing.T) {
+		dbusApiCaller = func(bus, path, intf string, timeout int, args ...interface{}) (interface{}, error) {
+			assert.Equal(t, "org.SONiC.HostService.ssl_profile", bus)
+			assert.Equal(t, "/org/SONiC/HostService/ssl_profile", path)
+			assert.Equal(t, "org.SONiC.HostService.ssl_profile.install_profile", intf)
+			assert.Equal(t, "siem-east", args[0])
+			assert.Equal(t, "/etc/sonic/telemetry/certz_profiles/siem-east/cert", args[1])
+			assert.Equal(t, "/etc/sonic/telemetry/certz_profiles/siem-east/key", args[2])
+			assert.Equal(t, "/etc/sonic/telemetry/certz_profiles/siem-east/ca", args[3])
+			return nil, nil
+		}
+		err := client.InstallSslProfile("siem-east",
+			"/etc/sonic/telemetry/certz_profiles/siem-east/cert",
+			"/etc/sonic/telemetry/certz_profiles/siem-east/key",
+			"/etc/sonic/telemetry/certz_profiles/siem-east/ca")
+		assert.NoError(t, err)
+	})
+
+	t.Run("DeleteSslProfile", func(t *testing.T) {
+		dbusApiCaller = func(bus, path, intf string, timeout int, args ...interface{}) (interface{}, error) {
+			assert.Equal(t, "org.SONiC.HostService.ssl_profile.delete_profile", intf)
+			assert.Equal(t, "siem-east", args[0])
+			return nil, nil
+		}
+		err := client.DeleteSslProfile("siem-east")
+		assert.NoError(t, err)
+	})
+
+	t.Run("SslProfileCheckpoint", func(t *testing.T) {
+		dbusApiCaller = func(bus, path, intf string, timeout int, args ...interface{}) (interface{}, error) {
+			assert.Equal(t, "org.SONiC.HostService.ssl_profile.create_checkpoint", intf)
+			assert.Equal(t, "siem-east", args[0])
+			return nil, nil
+		}
+		err := client.SslProfileCheckpoint(CredzCPCreate, "siem-east")
+		assert.NoError(t, err)
+	})
+}
