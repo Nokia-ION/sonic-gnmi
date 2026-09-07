@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Azure/sonic-mgmt-common/translib"
+	pathutil "github.com/Azure/sonic-mgmt-common/translib/path"
 	"github.com/Workiva/go-datastructures/queue"
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
@@ -704,6 +705,73 @@ func getBundleVersion(extensions []*gnmi_extpb.Extension) *string {
 	return nil
 }
 
+// stripOCModulePrefix removes YANG module prefixes from path elements when the
+// request origin is "openconfig". ygnmi/ygot resolve schema nodes by unqualified
+// names (e.g. "interfaces") once origin is set.
+func stripOCModulePrefix(origin string, p *gnmipb.Path) {
+	if p == nil || origin != "openconfig" {
+		return
+	}
+	pathutil.RemoveModulePrefix(p)
+}
+
+// resolveStripOrigin returns "openconfig" when the prefix or path carries that
+// origin, matching subscribe behaviour (see client_subscribe.go and
+// translSubscriber.stripOCModulePrefix).
+func resolveStripOrigin(prefix, path *gnmipb.Path) string {
+	origin := ""
+	if prefix != nil {
+		origin = prefix.GetOrigin()
+	}
+	if origin == "" && path != nil {
+		origin = path.GetOrigin()
+	}
+	if origin == "openconfig" {
+		return "openconfig"
+	}
+	return ""
+}
+
+// resolveGetStripOrigin returns the origin used to decide GET response path
+// stripping. Uses the same openconfig check as subscribe, and treats unprefixed
+// OpenConfig paths (/interfaces/...) as openconfig because TranslClient is
+// OpenConfig-only and those requests do not set Path.Origin on the gNMI message.
+func resolveGetStripOrigin(prefix, path *gnmipb.Path) string {
+	if o := resolveStripOrigin(prefix, path); o != "" {
+		return o
+	}
+	return "openconfig"
+}
+
+// responsePath returns a copy of path with module prefixes stripped when origin
+// is openconfig. The input path is left unchanged so internal path2URI keys are
+// stable.
+func responsePath(prefix *gnmipb.Path, path *gnmipb.Path) *gnmipb.Path {
+	if path == nil {
+		return nil
+	}
+	p := proto.Clone(path).(*gnmipb.Path)
+	stripOCModulePrefix(resolveGetStripOrigin(prefix, path), p)
+	return p
+}
+
+// responseNotification returns a copy of a gNMI notification with module prefixes
+// stripped from prefix, update, and delete paths when origin is openconfig.
+func responseNotification(prefix *gnmipb.Path, n *gnmipb.Notification) *gnmipb.Notification {
+	if n == nil {
+		return nil
+	}
+	cloned := proto.Clone(n).(*gnmipb.Notification)
+	cloned.Prefix = responsePath(prefix, cloned.Prefix)
+	for _, u := range cloned.Update {
+		u.Path = responsePath(prefix, u.Path)
+	}
+	for i, d := range cloned.Delete {
+		cloned.Delete[i] = responsePath(prefix, d)
+	}
+	return cloned
+}
+
 // setPrefixTarget fills prefix taregt for given Notification objects.
 func setPrefixTarget(notifs []*gnmipb.Notification, target string) {
 	for _, n := range notifs {
@@ -726,7 +794,7 @@ func buildValue(prefix *gnmipb.Path, path *gnmipb.Path, enc gnmipb.Encoding,
 		}
 		return &spb.Value{
 			Prefix:       prefix,
-			Path:         path,
+			Path:         responsePath(prefix, path),
 			Timestamp:    time.Now().UnixNano(),
 			SyncResponse: false,
 			Val:          typedVal,
@@ -757,7 +825,7 @@ func buildValue(prefix *gnmipb.Path, path *gnmipb.Path, enc gnmipb.Encoding,
 			setPrefixTarget(notifications, prefix.Target)
 		}
 		return &spb.Value{
-			Notification: notifications[0],
+			Notification: responseNotification(prefix, notifications[0]),
 		}, nil
 	default:
 		return nil, fmt.Errorf("Unsupported Encoding %s", enc)
@@ -779,7 +847,7 @@ func buildValueForGet(prefix *gnmipb.Path, path *gnmipb.Path, enc gnmipb.Encodin
 	case gnmipb.Encoding_JSON, gnmipb.Encoding_JSON_IETF:
 		return &spb.Value{
 			Prefix:       prefix,
-			Path:         path,
+			Path:         responsePath(prefix, path),
 			Timestamp:    time.Now().UnixNano(),
 			SyncResponse: false,
 			Val:          &gnmipb.TypedValue{Value: &gnmipb.TypedValue_JsonIetfVal{JsonIetfVal: []byte("{}")}},
@@ -789,7 +857,10 @@ func buildValueForGet(prefix *gnmipb.Path, path *gnmipb.Path, enc gnmipb.Encodin
 		// The Notification has no update and its prefix is the full path.
 		fullPath := transutil.GnmiTranslFullPath(prefix, path)
 		return &spb.Value{
-			Notification: &gnmipb.Notification{Prefix: fullPath, Timestamp: time.Now().UnixNano()},
+			Notification: responseNotification(prefix, &gnmipb.Notification{
+				Prefix:    fullPath,
+				Timestamp: time.Now().UnixNano(),
+			}),
 		}, nil
 
 	default:
