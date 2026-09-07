@@ -446,7 +446,94 @@ func TestBuildValueForGet(t *testing.T) {
 	}
 }
 
-// TestBuildSelectCases validates the construction of reflect.SelectCase slices
+func TestResponsePath_OpenConfigStripsModulePrefix(t *testing.T) {
+	prefix := &gnmipb.Path{Origin: "openconfig", Target: "dut1"}
+	path := &gnmipb.Path{Elem: []*gnmipb.PathElem{
+		{Name: "openconfig-interfaces:interfaces"},
+		{Name: "interface", Key: map[string]string{"name": "Ethernet1"}},
+		{Name: "openconfig-if-ethernet:ethernet"},
+		{Name: "state"},
+		{Name: "port-speed"},
+	}}
+
+	got := responsePath(prefix, path)
+	if got.Elem[0].Name != "interfaces" {
+		t.Errorf("elem[0].Name: got %q, want interfaces", got.Elem[0].Name)
+	}
+	if got.Elem[2].Name != "ethernet" {
+		t.Errorf("elem[2].Name: got %q, want ethernet", got.Elem[2].Name)
+	}
+	if path.Elem[0].Name != "openconfig-interfaces:interfaces" {
+		t.Errorf("input path mutated: elem[0].Name = %q", path.Elem[0].Name)
+	}
+}
+
+func TestResponsePath_PathOriginStripsModulePrefix(t *testing.T) {
+	prefix := &gnmipb.Path{Target: "dut1"}
+	path := &gnmipb.Path{
+		Origin: "openconfig",
+		Elem: []*gnmipb.PathElem{
+			{Name: "openconfig-interfaces:interfaces"},
+			{Name: "interface", Key: map[string]string{"name": "Ethernet1"}},
+		},
+	}
+
+	got := responsePath(prefix, path)
+	if got.Elem[0].Name != "interfaces" {
+		t.Errorf("elem[0].Name: got %q, want interfaces", got.Elem[0].Name)
+	}
+}
+
+func TestResponsePath_UnprefixedPathStripsModulePrefix(t *testing.T) {
+	prefix := &gnmipb.Path{Target: "dut1"}
+	path := &gnmipb.Path{Elem: []*gnmipb.PathElem{
+		{Name: "openconfig-interfaces:interfaces"},
+		{Name: "interface", Key: map[string]string{"name": "Ethernet0"}},
+		{Name: "openconfig-if-ethernet:ethernet"},
+		{Name: "state"},
+		{Name: "port-speed"},
+	}}
+
+	got := responsePath(prefix, path)
+	if got.Elem[0].Name != "interfaces" {
+		t.Errorf("elem[0].Name: got %q, want interfaces", got.Elem[0].Name)
+	}
+	if got.Elem[2].Name != "ethernet" {
+		t.Errorf("elem[2].Name: got %q, want ethernet", got.Elem[2].Name)
+	}
+}
+
+func TestBuildValue_OpenConfigStripsGetPath(t *testing.T) {
+	prefix := &gnmipb.Path{Origin: "openconfig", Target: "dut1"}
+	path := &gnmipb.Path{Elem: []*gnmipb.PathElem{
+		{Name: "openconfig-interfaces:interfaces"},
+		{Name: "interface", Key: map[string]string{"name": "Ethernet1"}},
+		{Name: "openconfig-if-ethernet:ethernet"},
+		{Name: "state"},
+		{Name: "port-speed"},
+	}}
+	typedVal := &gnmipb.TypedValue{
+		Value: &gnmipb.TypedValue_JsonIetfVal{
+			JsonIetfVal: []byte(`{"openconfig-if-ethernet:port-speed":"openconfig-if-ethernet:SPEED_1GB"}`),
+		},
+	}
+
+	got, err := buildValue(prefix, path, gnmipb.Encoding_JSON_IETF, typedVal, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Path.Elem[0].Name != "interfaces" {
+		t.Errorf("response path elem[0]: got %q, want interfaces", got.Path.Elem[0].Name)
+	}
+	if got.Path.Elem[2].Name != "ethernet" {
+		t.Errorf("response path elem[2]: got %q, want ethernet", got.Path.Elem[2].Name)
+	}
+	wantVal := `{"openconfig-if-ethernet:port-speed":"openconfig-if-ethernet:SPEED_1GB"}`
+	if string(got.Val.GetJsonIetfVal()) != wantVal {
+		t.Errorf("json value changed: got %s, want %s", got.Val.GetJsonIetfVal(), wantVal)
+	}
+}
+
 func TestBuildSelectCases(t *testing.T) {
 	// 1. Setup mock channels and tickers
 	tick100 := time.NewTicker(100 * time.Millisecond)
