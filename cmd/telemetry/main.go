@@ -84,6 +84,10 @@ type TelemetryConfig struct {
 	MaxRecvMsgSize           *int
 	MaxSendMsgSize           *int
 	PathsBlacklistFile       *string
+	TPMDevice                *string
+	IakCertFile              *string
+	IDevIDCertFile           *string
+	IakContextFile           *string
 }
 
 func main() {
@@ -228,6 +232,10 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 		MaxRecvMsgSize:           fs.Int("max_recv_msg_size", 4*1024*1024, "Maximum message size in bytes that the server can receive"),
 		MaxSendMsgSize:           fs.Int("max_send_msg_size", 4*1024*1024, "Maximum message size in bytes that the server can send"),
 		PathsBlacklistFile:       fs.String("paths_blacklist", "", "File with blacklisted gNMI paths, one 'TARGET PATH' entry per line. Requests referencing these paths are rejected. Empty disables the blacklist."),
+		TPMDevice:                fs.String("tpm_device", "", "Path to the TPM device file (e.g. /dev/tpmrm0). gNSI attestz is not served while empty."),
+		IakCertFile:              fs.String("iak_cert_file", "/keys/iak-chain.crt", "Full path name of the IAK certificate."),
+		IDevIDCertFile:           fs.String("idevid_cert_file", "/keys/idevid-chain.crt", "Full path name of the IDevID certificate."),
+		IakContextFile:           fs.String("iak_context_file", "/run/tpm/iak_context.bin", "Full path name of the saved TPM context of the IAK signing key."),
 	}
 
 	fs.Var(&telemetryCfg.UserAuth, "client_auth", "Client auth mode(s) - none,cert,password")
@@ -314,6 +322,15 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 	cfg.AllowNoClientCert = *telemetryCfg.AllowNoClientCert
 	cfg.IntManFile = *telemetryCfg.IntManFile
 	cfg.CertzMetaFile = *telemetryCfg.CertzMetaFile
+	cfg.TPMPath = *telemetryCfg.TPMDevice
+	cfg.IakCertFile = *telemetryCfg.IakCertFile
+	cfg.IDevIDCertFile = *telemetryCfg.IDevIDCertFile
+	cfg.IakContextFile = *telemetryCfg.IakContextFile
+	// The owner IAK cert that enrollz installs lives beside the factory IAK
+	// cert, which is the directory the enrollment material is provisioned into.
+	if cfg.IakCertFile != "" {
+		cfg.OIakCertFile = filepath.Join(filepath.Dir(cfg.IakCertFile), "oiak.crt")
+	}
 
 	gnmi.SetCrlExpireDuration(time.Duration(*telemetryCfg.CrlExpireDuration) * time.Second)
 
