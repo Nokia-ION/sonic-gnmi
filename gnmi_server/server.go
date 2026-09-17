@@ -44,6 +44,8 @@ import (
 	"golang.org/x/net/ipv6"
 	"google.golang.org/grpc/credentials"
 
+	attestz_pb "github.com/openconfig/attestz/proto/tpm_attestz"
+	enrollz_pb "github.com/openconfig/attestz/proto/tpm_enrollz"
 	gnoi_file_pb "github.com/openconfig/gnoi/file"
 	gnoi_healthz_pb "github.com/openconfig/gnoi/healthz"
 	gnoi_os_pb "github.com/openconfig/gnoi/os"
@@ -145,6 +147,12 @@ type Server struct {
 	// DB Journals
 	configDbJournal *DbJournal
 	gnsiCredentialz *GNSICredentialzServer
+	// gNSI attestz/enrollz servers and the hardware identity they report.
+	enrollzServer       *TpmEnrollzServer
+	attestzServer       *TpmAttestzServer
+	controlCardsMu      sync.Mutex
+	cachedControlCards  []*controlCardInfo
+	cachedFromInventory bool
 	gnsi_credentialz_pb.UnimplementedCredentialzServer
 }
 
@@ -303,6 +311,12 @@ type Config struct {
 	// PathsBlacklist rejects Get/Set/Subscribe requests referencing
 	// blacklisted paths. Nil disables enforcement.
 	PathsBlacklist *pathblacklist.Policy
+	// gnsi.attestz / gnsi.enrollz TPM identity flags
+	TPMPath        string // Path to the TPM device file. Attestz is not served when empty.
+	IakCertFile    string // Path to the device's factory IAK certificate chain.
+	IDevIDCertFile string // Path to the device's factory IDevID certificate chain.
+	OIakCertFile   string // Path to the owner IAK certificate, derived from IakCertFile.
+	IakContextFile string // Path to the saved TPM context of the IAK signing key.
 }
 
 // DBusOSBackend is a concrete implementation of OSBackend
@@ -394,13 +408,20 @@ func (i AuthTypes) Unset(mode string) error {
 // gNOI Debug is registered separately on UDS only.
 func registerSharedServices(s *grpc.Server, srv *Server, fileSrv *FileServer,
 	osSrv *OSServer, containerzSrv *ContainerzServer,
-	healthzSrv *HealthzServer, orasSrv *OrasServer, certzSrv *GNSICertzServer, authzSrv *GNSIAuthzServer, pathzSrv *GNSIPathzServer, credentialzSrv *GNSICredentialzServer) {
+	healthzSrv *HealthzServer, orasSrv *OrasServer, certzSrv *GNSICertzServer, authzSrv *GNSIAuthzServer, pathzSrv *GNSIPathzServer, credentialzSrv *GNSICredentialzServer,
+	enrollzSrv *TpmEnrollzServer, attestzSrv *TpmAttestzServer) {
 	gnmipb.RegisterGNMIServer(s, srv)
 	factory_reset.RegisterFactoryResetServer(s, srv)
 	gnsi_certz_pb.RegisterCertzServer(s, certzSrv)
 	gnsi_authz_pb.RegisterAuthzServer(s, authzSrv)
 	gnsi_pathz_pb.RegisterPathzServer(s, pathzSrv)
 	gnsi_credentialz_pb.RegisterCredentialzServer(s, credentialzSrv)
+	enrollz_pb.RegisterTpmEnrollzServiceServer(s, enrollzSrv)
+	// Attest cannot do anything without a TPM, so the service is only
+	// advertised once one is configured rather than failing every RPC.
+	if srv.config.TPMPath != "" {
+		attestz_pb.RegisterTpmAttestzServiceServer(s, attestzSrv)
+	}
 	spb_jwt_gnoi.RegisterSonicJwtServiceServer(s, srv)
 	if srv.config.EnableTranslibWrite || srv.config.EnableNativeWrite {
 		gnoi_system_pb.RegisterSystemServer(s, srv)
@@ -702,6 +723,10 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 
 	credentialzSrv := NewGNSICredentialzServer(srv)
 	srv.gnsiCredentialz = credentialzSrv
+	enrollzSrv := NewTpmEnrollzServer(srv)
+	srv.enrollzServer = enrollzSrv
+	attestzSrv := NewTpmAttestzServer(srv)
+	srv.attestzServer = attestzSrv
 	orasSrv := &OrasServer{Server: srv}
 	var err error
 
@@ -724,7 +749,7 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 			srv.s = nil
 		} else {
 			srv.config.Port = int64(srv.lis.Addr().(*net.TCPAddr).Port)
-			registerSharedServices(srv.s, srv, fileSrv, osSrv, containerzSrv, healthzSrv, orasSrv, certzSrv, authzSrv, pathzSrv, credentialzSrv)
+			registerSharedServices(srv.s, srv, fileSrv, osSrv, containerzSrv, healthzSrv, orasSrv, certzSrv, authzSrv, pathzSrv, credentialzSrv, enrollzSrv, attestzSrv)
 		}
 	}
 
@@ -758,7 +783,7 @@ func NewServer(config *Config, tlsOpts []grpc.ServerOption, commonOpts []grpc.Se
 					srv.udsServer.Stop()
 					srv.udsServer = nil
 				} else {
-					registerSharedServices(srv.udsServer, srv, fileSrv, osSrv, containerzSrv, healthzSrv, orasSrv, certzSrv, authzSrv, pathzSrv, credentialzSrv)
+					registerSharedServices(srv.udsServer, srv, fileSrv, osSrv, containerzSrv, healthzSrv, orasSrv, certzSrv, authzSrv, pathzSrv, credentialzSrv, enrollzSrv, attestzSrv)
 					if srv.config.EnableTranslibWrite || srv.config.EnableNativeWrite {
 						gnoi_debug_pb.RegisterDebugServer(srv.udsServer, debugSrv)
 					}

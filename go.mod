@@ -18,10 +18,12 @@ require (
 	github.com/golang/protobuf v1.5.4
 	github.com/google/gnxi v0.0.0-20181220173256-89f51f0ce1e2
 	github.com/google/go-cmp v0.7.0
+	github.com/google/go-tpm v0.9.7
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/kylelemons/godebug v1.1.0
 	github.com/maruel/natural v1.1.1
 	github.com/msteinert/pam v0.0.0-20201130170657-e61372126161
+	github.com/openconfig/attestz v0.6.11
 	github.com/openconfig/gnmi v0.14.1
 	github.com/openconfig/gnoi v0.4.0
 	github.com/openconfig/gnsi v1.9.0
