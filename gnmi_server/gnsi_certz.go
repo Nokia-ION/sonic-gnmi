@@ -273,6 +273,7 @@ func (srv *GNSICertzServer) DeleteProfile(ctx context.Context, req *certz.Delete
 	}
 
 	srv.deleteSslProfile(profileID)
+	unbindProfile(profileID)
 
 	return &certz.DeleteProfileResponse{}, nil
 }
