@@ -516,12 +516,15 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 
 	providers := []certprovider.Provider{}
 	identityOptions := advancedtls.IdentityCertificateOptions{
-		// Read the certificate and the key for every new connection.
+		// Resolve the certificate-id binding and read the certificate and the
+		// key for every new connection, so rebinding takes effect without a
+		// restart.
 		GetIdentityCertificatesForServer: func(*tls.ClientHelloInfo) ([]*tls.Certificate, error) {
 			muPath.RLock()
 			defer muPath.RUnlock()
 
-			cert, err := tls.LoadX509KeyPair(cfg.SrvCertLnk, cfg.SrvKeyLnk)
+			paths := servingProfilePaths(cfg)
+			cert, err := tls.LoadX509KeyPair(paths.Cert, paths.Key)
 			if err != nil {
 				return nil, fmt.Errorf("could not load server key pair: %s", err)
 			}
@@ -539,18 +542,14 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 	}
 	if cfg.CaCertFile != "" {
 		serverOption.RootOptions = advancedtls.RootCertificateOptions{
-			// Read the CA certificate for every new connection.
+			// Read the bound profile's CA certificate for every new connection.
 			GetRootCertificates: func(params *advancedtls.ConnectionInfo) (*advancedtls.RootCertificates, error) {
 				muPath.RLock()
 				defer muPath.RUnlock()
 
-				caCertPem, err := os.ReadFile(cfg.CaCertLnk)
+				certPool, err := readCertPool(servingProfilePaths(cfg).CA)
 				if err != nil {
-					return nil, fmt.Errorf("could not read CA certificate: %s", err)
-				}
-				certPool := x509.NewCertPool()
-				if ok := certPool.AppendCertsFromPEM(caCertPem); !ok {
-					return nil, fmt.Errorf("failed to append CA certificate")
+					return nil, err
 				}
 				return &advancedtls.RootCertificates{TrustCerts: certPool}, nil
 			},
