@@ -5,9 +5,11 @@ import (
 	"errors"
 	"github.com/Azure/sonic-mgmt-common/translib"
 	"github.com/Workiva/go-datastructures/queue"
+	"github.com/golang/protobuf/proto"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	gnmi_extpb "github.com/openconfig/gnmi/proto/gnmi_ext"
 	"github.com/openconfig/ygot/ygot"
+	spb "github.com/sonic-net/sonic-gnmi/proto"
 	"reflect"
 	"sync"
 	"testing"
@@ -789,4 +791,170 @@ func TestTickerCleanup_Coverage(t *testing.T) {
 
 	// Test with nil map
 	tickerCleanup(nil)
+}
+
+// grpcServerListPayload is the shape translib answers a grpc-server list with:
+// an RFC 7951 object holding the list, whose name carries a module prefix and
+// whose entries hold the key leaf alongside the containers.
+const grpcServerListPayload = `{"openconfig-system-grpc:grpc-server":[` +
+	`{"name":"gnxi","config":{"port":50052},"state":{"name":"gnxi","port":50052}},` +
+	`{"name":"gnmi","config":{"port":8080},"state":{"name":"gnmi","port":8080}}]}`
+
+func jsonIetf(s string) *gnmipb.TypedValue {
+	return &gnmipb.TypedValue{Value: &gnmipb.TypedValue_JsonIetfVal{JsonIetfVal: []byte(s)}}
+}
+
+// grpcServerPath builds /system/grpc-servers/grpc-server<keys>/<rest...>.
+func grpcServerPath(keys map[string]string, rest ...string) *gnmipb.Path {
+	elems := []*gnmipb.PathElem{
+		{Name: "system"},
+		{Name: "grpc-servers"},
+		{Name: "grpc-server", Key: keys},
+	}
+	for _, r := range rest {
+		elems = append(elems, &gnmipb.PathElem{Name: r})
+	}
+	return &gnmipb.Path{Elem: elems}
+}
+
+// update is the key and JSON value of one produced update, which is all the
+// tests below care about.
+type update struct {
+	key  string
+	json string
+}
+
+func updatesOf(t *testing.T, values []*spb.Value) []update {
+	t.Helper()
+	var got []update
+	for _, v := range values {
+		elems := v.GetPath().GetElem()
+		got = append(got, update{
+			key:  elems[2].GetKey()["name"],
+			json: string(v.GetVal().GetJsonIetfVal()),
+		})
+	}
+	return got
+}
+
+func TestExpandListFallback(t *testing.T) {
+	servedPath := "/openconfig-system:system/grpc-servers/grpc-server"
+	prefix := &gnmipb.Path{}
+
+	tests := []struct {
+		name    string
+		path    *gnmipb.Path
+		enc     gnmipb.Encoding
+		resp    *translib.GetResponse
+		payload *gnmipb.TypedValue
+		want    []update
+		// Whether the list stood in for the request, as opposed to the request
+		// being served as asked and needing the ordinary single-update path.
+		wantExpanded bool
+	}{{
+		// The case FP's GetAll(GrpcServerAny().Name().State()) asks for: a
+		// wildcarded list means every instance, so every instance answers.
+		name:         "wildcarded leaf answers per instance",
+		path:         grpcServerPath(map[string]string{"name": "*"}, "state", "name"),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		resp:         &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+		want:         []update{{key: "gnxi", json: `"gnxi"`}, {key: "gnmi", json: `"gnmi"`}},
+		wantExpanded: true,
+	}, {
+		// A bare list means the same thing, and carries no keys to name, so
+		// the key names have to come from the schema via translib.
+		name:         "keyless leaf uses the key names translib reported",
+		path:         grpcServerPath(nil, "state", "name"),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		resp:         &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+		want:         []update{{key: "gnxi", json: `"gnxi"`}, {key: "gnmi", json: `"gnmi"`}},
+		wantExpanded: true,
+	}, {
+		name:         "key names fall back to the ones the request wildcarded",
+		path:         grpcServerPath(map[string]string{"name": "*"}, "state", "name"),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		resp:         &translib.GetResponse{ServedPath: servedPath},
+		want:         []update{{key: "gnxi", json: `"gnxi"`}, {key: "gnmi", json: `"gnmi"`}},
+		wantExpanded: true,
+	}, {
+		name:         "a container below the list is carried whole",
+		path:         grpcServerPath(map[string]string{"name": "*"}, "config"),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		resp:         &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+		want:         []update{{key: "gnxi", json: `{"port":50052}`}, {key: "gnmi", json: `{"port":8080}`}},
+		wantExpanded: true,
+	}, {
+		name:         "instances without the node asked for are left out",
+		path:         grpcServerPath(map[string]string{"name": "*"}, "state", "port"),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		resp:         &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+		payload:      jsonIetf(`{"grpc-server":[{"name":"gnxi","state":{"port":50052}},{"name":"gnmi","state":{}}]}`),
+		want:         []update{{key: "gnxi", json: `50052`}},
+		wantExpanded: true,
+	}, {
+		// The list still answered the request, so the answer is no updates.
+		// Falling through here would report the whole list at the list path.
+		name:         "no instance carrying the node answers with nothing",
+		path:         grpcServerPath(map[string]string{"name": "*"}, "state", "absent"),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		resp:         &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+		wantExpanded: true,
+	}, {
+		name: "a request served as asked is left alone",
+		path: grpcServerPath(map[string]string{"name": "gnxi"}, "state", "name"),
+		enc:  gnmipb.Encoding_JSON_IETF,
+		resp: &translib.GetResponse{},
+	}, {
+		// PROTO builds its updates by walking the value tree instead.
+		name: "proto encoding is left alone",
+		path: grpcServerPath(map[string]string{"name": "*"}, "state", "name"),
+		enc:  gnmipb.Encoding_PROTO,
+		resp: &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+	}, {
+		name: "the list itself is already every instance",
+		path: grpcServerPath(map[string]string{"name": "*"}),
+		enc:  gnmipb.Encoding_JSON_IETF,
+		resp: &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+	}, {
+		name:    "a payload that is not the list is left alone",
+		path:    grpcServerPath(map[string]string{"name": "*"}, "state", "name"),
+		enc:     gnmipb.Encoding_JSON_IETF,
+		resp:    &translib.GetResponse{ServedPath: servedPath, ServedListKeys: []string{"name"}},
+		payload: jsonIetf(`{"something-else":[{"name":"gnxi"}]}`),
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := tt.payload
+			if payload == nil {
+				payload = jsonIetf(grpcServerListPayload)
+			}
+
+			values, expanded := expandListFallback(prefix, tt.path, tt.enc, tt.resp, payload)
+			if expanded != tt.wantExpanded {
+				t.Errorf("expandListFallback() expanded = %v, want %v", expanded, tt.wantExpanded)
+			}
+			got := updatesOf(t, values)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("expandListFallback() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The request path must survive expansion: it is reused for every instance and
+// is a map key in path2URI.
+func TestExpandListFallbackLeavesRequestPathAlone(t *testing.T) {
+	path := grpcServerPath(map[string]string{"name": "*"}, "state", "name")
+	before := proto.Clone(path).(*gnmipb.Path)
+
+	expandListFallback(&gnmipb.Path{}, path, gnmipb.Encoding_JSON_IETF,
+		&translib.GetResponse{
+			ServedPath:     "/openconfig-system:system/grpc-servers/grpc-server",
+			ServedListKeys: []string{"name"},
+		}, jsonIetf(grpcServerListPayload))
+
+	if !proto.Equal(before, path) {
+		t.Errorf("request path was modified: got %v, want %v", path, before)
+	}
 }
