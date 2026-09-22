@@ -289,7 +289,10 @@ func TranslProcessGet(uriPath string, op *string, ctx context.Context, encoding 
 	}
 
 	fmtType := getTranslFmtType(encoding)
-	req := translib.GetRequest{Path: uriPath, FmtType: fmtType, User: translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles}, QueryParams: qp}
+	// gNMI paths routinely leave a list unkeyed to mean "every instance", and
+	// an update can name the path it carries, so let Get answer such a request
+	// with the enclosing list rather than nothing.
+	req := translib.GetRequest{Path: uriPath, FmtType: fmtType, User: translib.UserRoles{Name: rc.Auth.User, Roles: rc.Auth.Roles}, QueryParams: qp, ListFallback: true}
 	if rc.BundleVersion != nil {
 		nver, err := translib.NewVersion(*rc.BundleVersion)
 		if err != nil {
@@ -318,11 +321,13 @@ func TranslProcessGet(uriPath string, op *string, ctx context.Context, encoding 
 		json.Compact(dst, data)
 		jv = dst.Bytes()
 
-		/* Fill the values into GNMI data structures . */
+		/* Fill the values into GNMI data structures . The response comes back
+		   for every encoding because it carries ServedPath, which the caller
+		   needs to label an update with the path it actually describes. */
 		return &gnmipb.TypedValue{
 			Value: &gnmipb.TypedValue_JsonIetfVal{
 				JsonIetfVal: jv,
-			}}, nil, nil
+			}}, &resp, nil
 	}
 
 }
