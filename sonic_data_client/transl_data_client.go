@@ -3,10 +3,12 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -199,10 +201,23 @@ func processGetWorker(pathChan <-chan pathFromGetReq, valueChan chan<- *spb.Valu
 		}
 
 		var valueTree ygot.ValidatedGoStruct
+		respPath := path.path
 		if resp != nil {
 			valueTree = resp.ValueTree
+			// An expansion that matched no instance still answers the request:
+			// the list stood in for a node none of its instances carry, so the
+			// answer is no updates rather than the list itself.
+			if instances, expanded := expandListFallback(path.c.prefix, path.path, path.c.encoding, resp, val); expanded {
+				for _, v := range instances {
+					valueChan <- v
+				}
+				continue
+			}
+			if p, ok := servedRequestPath(path.c.prefix, path.path, resp.ServedPath); ok {
+				respPath = p
+			}
 		}
-		v, err := buildValueForGet(path.c.prefix, path.path, path.c.encoding, val, valueTree)
+		v, err := buildValueForGet(path.c.prefix, respPath, path.c.encoding, val, valueTree)
 		if err != nil {
 			errChan <- err
 			return
@@ -746,6 +761,207 @@ func resolveGetStripOrigin(prefix, path *gnmipb.Path) string {
 // responsePath returns a copy of path with module prefixes stripped when origin
 // is openconfig. The input path is left unchanged so internal path2URI keys are
 // stable.
+// servedRequestPath re-expresses the path translib actually served as a
+// request path, so that an update describes the payload it carries rather than
+// the path that was asked for. translib only ever falls back to a prefix of
+// the requested path, so the answer is the request path cut to the served
+// depth, which leaves the client's prefix untouched.
+//
+// Reports false when there is nothing to re-express, or when the served path
+// cannot be lined up with the request, in which case the caller keeps the
+// path it already had.
+func servedRequestPath(prefix, path *gnmipb.Path, servedPath string) (*gnmipb.Path, bool) {
+	if servedPath == "" {
+		return nil, false
+	}
+	// Only the Elem form can be cut by depth; GnmiTranslFullPath still accepts
+	// the deprecated Element form, which carries no keys to count against.
+	if path.GetElem() == nil {
+		return nil, false
+	}
+	served, err := ygot.StringToPath(servedPath, ygot.StructuredPath)
+	if err != nil {
+		log.V(1).Infof("cannot parse served path %q: %v", servedPath, err)
+		return nil, false
+	}
+	depth := len(served.GetElem()) - len(prefix.GetElem())
+	if depth < 0 || depth > len(path.GetElem()) {
+		log.V(1).Infof("served path %q does not sit under prefix %v", servedPath, prefix)
+		return nil, false
+	}
+	shortened := proto.Clone(path).(*gnmipb.Path)
+	shortened.Elem = shortened.GetElem()[:depth]
+	return shortened, true
+}
+
+// expandListFallback splits a list payload that translib served in place of a
+// node below it into one update per list instance, each addressed by its keys.
+//
+// An unkeyed or wildcarded list in a request asks about every instance, so the
+// answer is one update per instance. A single update carrying the whole list
+// names no instance, and a client that resolves its request path against the
+// response path, as the ygot based ones do, cannot read the node it asked for
+// out of that.
+//
+// Returns nil when the payload cannot be split this way, which leaves the
+// caller to label one update with the list path.
+func expandListFallback(prefix, path *gnmipb.Path, enc gnmipb.Encoding,
+	resp *translib.GetResponse, typedVal *gnmipb.TypedValue) ([]*spb.Value, bool) {
+
+	if resp == nil || resp.ServedPath == "" || typedVal == nil {
+		return nil, false
+	}
+	// PROTO builds its updates by walking the value tree instead.
+	if enc != gnmipb.Encoding_JSON && enc != gnmipb.Encoding_JSON_IETF {
+		return nil, false
+	}
+
+	listPath, ok := servedRequestPath(prefix, path, resp.ServedPath)
+	if !ok {
+		return nil, false
+	}
+	depth := len(listPath.GetElem())
+	// Nothing was cut, so there is no list standing in for the request.
+	if depth == 0 || depth >= len(path.GetElem()) {
+		return nil, false
+	}
+	listElem := path.GetElem()[depth-1]
+	remainder := path.GetElem()[depth:]
+
+	// translib names the keys from the schema. A request that wildcarded the
+	// list rather than leaving it bare also carries them.
+	keyNames := resp.ServedListKeys
+	if len(keyNames) == 0 {
+		for name := range listElem.GetKey() {
+			keyNames = append(keyNames, name)
+		}
+	}
+	if len(keyNames) == 0 {
+		return nil, false
+	}
+
+	entries, ok := listEntriesFromPayload(typedVal, listElem.GetName())
+	if !ok {
+		return nil, false
+	}
+
+	values := make([]*spb.Value, 0, len(entries))
+	for _, entry := range entries {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(entry, &fields); err != nil {
+			return nil, false
+		}
+
+		keys := make(map[string]string, len(keyNames))
+		for _, name := range keyNames {
+			raw, found := jsonField(fields, name)
+			if !found {
+				return nil, false
+			}
+			key, ok := jsonScalarString(raw)
+			if !ok {
+				return nil, false
+			}
+			keys[name] = key
+		}
+
+		node, found := jsonNodeAt(fields, remainder)
+		if !found {
+			// This instance does not carry the node that was asked for.
+			continue
+		}
+
+		instance := proto.Clone(path).(*gnmipb.Path)
+		instance.Elem[depth-1] = &gnmipb.PathElem{Name: listElem.GetName(), Key: keys}
+		v, err := buildValue(prefix, instance, enc,
+			&gnmipb.TypedValue{Value: &gnmipb.TypedValue_JsonIetfVal{JsonIetfVal: node}}, nil)
+		if err != nil || v == nil {
+			log.V(1).Infof("cannot build update for list instance %v: %v", keys, err)
+			return nil, false
+		}
+		values = append(values, v)
+	}
+
+	return values, true
+}
+
+// listEntriesFromPayload unwraps the RFC 7951 object a list payload arrives in
+// and returns its entries.
+func listEntriesFromPayload(typedVal *gnmipb.TypedValue, listName string) ([]json.RawMessage, bool) {
+	raw := typedVal.GetJsonIetfVal()
+	if len(raw) == 0 {
+		raw = typedVal.GetJsonVal()
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var wrapper map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wrapper); err != nil {
+		return nil, false
+	}
+	inner, ok := jsonField(wrapper, listName)
+	if !ok {
+		return nil, false
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(inner, &entries); err != nil {
+		return nil, false
+	}
+	return entries, true
+}
+
+// jsonNodeAt walks elems through a decoded RFC 7951 object and returns the
+// node they name.
+func jsonNodeAt(fields map[string]json.RawMessage, elems []*gnmipb.PathElem) (json.RawMessage, bool) {
+	for i, e := range elems {
+		raw, ok := jsonField(fields, e.GetName())
+		if !ok {
+			return nil, false
+		}
+		if i == len(elems)-1 {
+			return raw, true
+		}
+		var next map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &next); err != nil {
+			return nil, false
+		}
+		fields = next
+	}
+	return nil, false
+}
+
+// jsonField looks up a field of a decoded RFC 7951 object. Only nodes from a
+// module other than their parent's are prefixed, so a name matches either
+// form.
+func jsonField(fields map[string]json.RawMessage, name string) (json.RawMessage, bool) {
+	if raw, ok := fields[name]; ok {
+		return raw, true
+	}
+	for field, raw := range fields {
+		if i := strings.IndexByte(field, ':'); i >= 0 && field[i+1:] == name {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+// jsonScalarString renders a JSON scalar the way a path key spells it.
+func jsonScalarString(raw json.RawMessage) (string, bool) {
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s, true
+	}
+	var n json.Number
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return n.String(), true
+	}
+	var b bool
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return strconv.FormatBool(b), true
+	}
+	return "", false
+}
+
 func responsePath(prefix *gnmipb.Path, path *gnmipb.Path) *gnmipb.Path {
 	if path == nil {
 		return nil
