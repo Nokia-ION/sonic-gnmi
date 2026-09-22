@@ -1312,6 +1312,18 @@ func TestSslProfileDbusMethods(t *testing.T) {
 	originalDbusApi := dbusApiCaller
 	defer func() { dbusApiCaller = originalDbusApi }()
 
+	t.Run("AddSslProfile", func(t *testing.T) {
+		dbusApiCaller = func(bus, path, intf string, timeout int, args ...interface{}) (interface{}, error) {
+			assert.Equal(t, "org.SONiC.HostService.ssl_profile", bus)
+			assert.Equal(t, "/org/SONiC/HostService/ssl_profile", path)
+			assert.Equal(t, "org.SONiC.HostService.ssl_profile.add_profile", intf)
+			assert.Equal(t, "siem-east", args[0])
+			return nil, nil
+		}
+		err := client.AddSslProfile("siem-east")
+		assert.NoError(t, err)
+	})
+
 	t.Run("InstallSslProfile", func(t *testing.T) {
 		dbusApiCaller = func(bus, path, intf string, timeout int, args ...interface{}) (interface{}, error) {
 			assert.Equal(t, "org.SONiC.HostService.ssl_profile", bus)
