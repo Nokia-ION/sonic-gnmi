@@ -42,5 +42,16 @@ func (srv *Server) Start(ctx context.Context, req *factory_reset.StartRequest) (
 	if err := json.Unmarshal([]byte(respStr), resp); err != nil {
 		return nil, status.Errorf(codes.Internal, "%s", fmt.Sprintf("Cannot unmarshal backend response: [%s], error: %v", respStr, err))
 	}
+
+	// The gNOI spec requires unsupported optional flags to be reported as
+	// INVALID_ARGUMENT with the ResetError in the status details.
+	if resetErr := resp.GetResetError(); resetErr != nil &&
+		(resetErr.GetFactoryOsUnsupported() || resetErr.GetZeroFillUnsupported()) {
+		st, err := status.New(codes.InvalidArgument, resetErr.GetDetail()).WithDetails(resetErr)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%s", resetErr.GetDetail())
+		}
+		return nil, st.Err()
+	}
 	return resp, nil
 }

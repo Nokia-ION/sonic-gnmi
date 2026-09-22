@@ -21,7 +21,27 @@ import (
 const (
 	factoryResetSuccess string = `{"reset_success": {}}`
 	factoryResetFail    string = `{"reset_error": {"other": true, "detail": "Previous reset is ongoing."}}`
+	factoryOsFail       string = `{"reset_error": {"factory_os_unsupported": true, "detail": "factory_os currently unsupported."}}`
+	zeroFillFail        string = `{"reset_error": {"zero_fill_unsupported": true, "detail": "zero_fill currently unsupported."}}`
 )
+
+func checkInvalidArgumentResetError(t *testing.T, err error, factoryOs, zeroFill bool) {
+	t.Helper()
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("Expected InvalidArgument error but got %v", err)
+	}
+	details := status.Convert(err).Details()
+	if len(details) != 1 {
+		t.Fatalf("Expected one status detail but got %#v", details)
+	}
+	resetErr, ok := details[0].(*reset_pb.ResetError)
+	if !ok {
+		t.Fatalf("Expected ResetError detail but got %#v", details[0])
+	}
+	if resetErr.GetFactoryOsUnsupported() != factoryOs || resetErr.GetZeroFillUnsupported() != zeroFill {
+		t.Fatalf("Unexpected ResetError detail %v", resetErr)
+	}
+}
 
 func TestGnoiResetServer(t *testing.T) {
 	s := createServer(t, 8081)
@@ -94,6 +114,26 @@ func TestGnoiResetServer(t *testing.T) {
 		if _, ok := resp.GetResponse().(*reset_pb.StartResponse_ResetError); !ok {
 			t.Fatalf("Expected ResetError but got %#v", resp.Response)
 		}
+	})
+
+	t.Run("Unsupported factory_os", func(t *testing.T) {
+		patch1 := gomonkey.ApplyFuncReturn(ssc.NewDbusClient, &ssc.DbusClient{}, nil)
+		patch2 := gomonkey.ApplyFuncReturn(ssc.DbusApi, factoryOsFail, nil)
+		defer patch1.Reset()
+		defer patch2.Reset()
+
+		_, err := c.Start(context.Background(), &reset_pb.StartRequest{FactoryOs: true})
+		checkInvalidArgumentResetError(t, err, true, false)
+	})
+
+	t.Run("Unsupported zero_fill", func(t *testing.T) {
+		patch1 := gomonkey.ApplyFuncReturn(ssc.NewDbusClient, &ssc.DbusClient{}, nil)
+		patch2 := gomonkey.ApplyFuncReturn(ssc.DbusApi, zeroFillFail, nil)
+		defer patch1.Reset()
+		defer patch2.Reset()
+
+		_, err := c.Start(context.Background(), &reset_pb.StartRequest{ZeroFill: true})
+		checkInvalidArgumentResetError(t, err, false, true)
 	})
 
 	t.Run("Unsuccessful Reset, Backend Error", func(t *testing.T) {
