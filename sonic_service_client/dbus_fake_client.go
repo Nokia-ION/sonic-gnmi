@@ -103,6 +103,13 @@ func (f *FakeClient) GLOMERestoreCheckpoint(ctx context.Context) error {
 	return nil
 }
 
+func (f *FakeClient) AddSslProfile(profileID string) error {
+	if f.Command != nil {
+		f.Command <- []string{"ssl_profile.add_profile", profileID}
+	}
+	return nil
+}
+
 func (f *FakeClient) InstallSslProfile(profileID, certSrc, keySrc, caSrc string) error {
 	if f.Command != nil {
 		f.Command <- []string{"ssl_profile.install_profile", profileID, certSrc, keySrc, caSrc}

@@ -52,6 +52,7 @@ type Service interface {
 	ConsoleCheckpoint(action CredzCheckpointAction) error
 	// Generic SSL profile (gNSI Certz → host-readable PEMs under ssl-certs)
 	InstallSslProfile(profileID, certSrc, keySrc, caSrc string) error
+	AddSslProfile(profileID string) error
 	DeleteSslProfile(profileID string) error
 	SslProfileCheckpoint(action CredzCheckpointAction, profileID string) error
 }
@@ -470,6 +471,17 @@ func (c *DbusClient) GLOMERestoreCheckpoint(ctx context.Context) error {
 		}
 	}
 	_, err := dbusApiCaller(busName, busPath, intName, timeout)
+	return err
+}
+
+func (c *DbusClient) AddSslProfile(profileID string) error {
+	modName := "ssl_profile"
+	busName := c.busNamePrefix + modName
+	busPath := c.busPathPrefix + modName
+	intName := c.intNamePrefix + modName + ".add_profile"
+
+	common_utils.IncCounter(common_utils.GNSI_CREDZ_SET)
+	_, err := dbusApiCaller(busName, busPath, intName, 10, profileID)
 	return err
 }
 
