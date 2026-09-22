@@ -222,6 +222,7 @@ func (srv *GNSICertzServer) AddProfile(ctx context.Context, req *certz.AddProfil
 	}
 
 	log.V(2).Infof("Successfully added profile: %q", profileID)
+	srv.addSslProfile(profileID)
 	return &certz.AddProfileResponse{}, nil
 }
 
@@ -1483,6 +1484,21 @@ func (srv *GNSICertzServer) sslProfileCheckpoint(action ssc.CredzCheckpointActio
 	defer sc.Close()
 	if err := sc.SslProfileCheckpoint(action, profileID); err != nil {
 		log.V(1).Infof("ssl_profile checkpoint %s for %q failed: %v", action, profileID, err)
+	}
+}
+
+func (srv *GNSICertzServer) addSslProfile(profileID string) {
+	if profileID == "" || profileID == defaultProfile {
+		return
+	}
+	sc, err := ssc.NewDbusClientProvider()
+	if err != nil {
+		log.V(1).Infof("ssl_profile add_profile: dbus client: %v", err)
+		return
+	}
+	defer sc.Close()
+	if err := sc.AddSslProfile(profileID); err != nil {
+		log.V(1).Infof("ssl_profile add_profile for %q failed: %v", profileID, err)
 	}
 }
 
