@@ -10,6 +10,7 @@ import (
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 	"github.com/sonic-net/sonic-gnmi/common_utils"
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/grpc/codes"
 )
 
 func TestToStatus(t *testing.T) {
@@ -43,6 +44,16 @@ func TestToStatus(t *testing.T) {
 	ToStatus(tlerr.TranslibDBScriptFail{
 		Description: "script fail",
 	})
+}
+
+func TestToStatusCodes(t *testing.T) {
+	assert.Equal(t, codes.NotFound, ToStatus(tlerr.NotFound("Port set %s not found", "X")).Code())
+	assert.Equal(t, codes.InvalidArgument, ToStatus(tlerr.InvalidArgs("bad")).Code())
+	assert.Equal(t, codes.FailedPrecondition, ToStatus(tlerr.FailedPrecondition("in use")).Code())
+	assert.Equal(t, "in use", ToStatus(tlerr.FailedPrecondition("in use")).Message())
+	assert.Equal(t, codes.InvalidArgument, ToStatus(tlerr.TranslibSyntaxValidationError{
+		ErrorStr: errors.New("does not match regular expression pattern")}).Code())
+	assert.Equal(t, codes.Unknown, ToStatus(errors.New("plain")).Code())
 }
 
 func TestTranslProcessGet_Success_Proto(t *testing.T) {
