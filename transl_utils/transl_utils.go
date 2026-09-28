@@ -96,6 +96,9 @@ func ToStatus(err error) *status.Status {
 	case tlerr.AlreadyExistsError:
 		code = codes.AlreadyExists
 		data = err.Error()
+	case tlerr.FailedPreconditionError:
+		code = codes.FailedPrecondition
+		data = err.Error()
 	case tlerr.TranslibCVLFailure:
 		code = codes.InvalidArgument
 		data = err.CVLErrorInfo.ConstraintErrMsg
@@ -514,21 +517,27 @@ func TranslProcessBulk(delete []*gnmipb.Path, replace []*gnmipb.Update, update [
 
 	resp, err = translib.Bulk(br)
 
+	// The first failure decides the gRPC code of the whole request.
+	var firstErr error
 	for k := range resp.Response {
 		__log_audit_msg(ctx, transLibOpMap[resp.Response[k].Operation], br.Request[k].Entry.Path, resp.Response[k].Entry.Err)
 		if resp.Response[k].Entry.Err != nil {
 			log.Warningf("%s=%v", resp.Response[k].Entry.Err.Error(), resp.Response[k].Entry.ErrSrc)
 			errors = append(errors, resp.Response[k].Entry.Err.Error())
+			if firstErr == nil {
+				firstErr = resp.Response[k].Entry.Err
+			}
 		}
 	}
 
 	if err != nil && len(errors) == 0 { //Global error
 		log.Errorf("Bulk Operation failed with Error: %v", err.Error())
 		errors = append(errors, err.Error())
+		firstErr = err
 	}
 
 	if len(errors) > 0 {
-		return fmt.Errorf("SET failed: %s", strings.Join(errors, "; "))
+		return status.Errorf(ToStatus(firstErr).Code(), "SET failed: %s", strings.Join(errors, "; "))
 	}
 
 	return nil

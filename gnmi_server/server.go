@@ -31,6 +31,7 @@ import (
 	_ "github.com/sonic-net/sonic-gnmi/show_client"
 	sdc "github.com/sonic-net/sonic-gnmi/sonic_data_client"
 	ssc "github.com/sonic-net/sonic-gnmi/sonic_service_client"
+	transutil "github.com/sonic-net/sonic-gnmi/transl_utils"
 
 	log "github.com/golang/glog"
 	"github.com/golang/protobuf/proto"
@@ -1590,13 +1591,16 @@ func (s *Server) Set(ctx context.Context, req *gnmipb.SetRequest) (*gnmipb.SetRe
 	err = dc.Set(req.GetDelete(), req.GetReplace(), req.GetUpdate())
 	if err != nil {
 		common_utils.IncCounter(common_utils.GNMI_SET_FAIL)
+		// A translib error left as it is reaches the client as Unknown.
+		err = transutil.ToStatus(err).Err()
 	} else {
 		s.SaveStartupConfig()
 	}
 
 	return &gnmipb.SetResponse{
-		Prefix:   req.GetPrefix(),
-		Response: results,
+		Prefix:    req.GetPrefix(),
+		Response:  results,
+		Timestamp: time.Now().UnixNano(),
 	}, err
 
 }
