@@ -942,6 +942,108 @@ func TestExpandListFallback(t *testing.T) {
 	}
 }
 
+func TestExpandWildcardListTarget(t *testing.T) {
+	prefix := &gnmipb.Path{}
+
+	tests := []struct {
+		name         string
+		path         *gnmipb.Path
+		enc          gnmipb.Encoding
+		payload      *gnmipb.TypedValue
+		want         []update
+		wantExpanded bool
+	}{{
+		name: "a wildcarded list answers per instance",
+		path: grpcServerPath(map[string]string{"name": "*"}),
+		enc:  gnmipb.Encoding_JSON_IETF,
+		want: []update{
+			{key: "gnxi", json: `{"name":"gnxi","config":{"port":50052},"state":{"name":"gnxi","port":50052}}`},
+			{key: "gnmi", json: `{"name":"gnmi","config":{"port":8080},"state":{"name":"gnmi","port":8080}}`},
+		},
+		wantExpanded: true,
+	}, {
+		name:         "a list with no instances answers with nothing",
+		path:         grpcServerPath(map[string]string{"name": "*"}),
+		enc:          gnmipb.Encoding_JSON_IETF,
+		payload:      jsonIetf(`{}`),
+		wantExpanded: true,
+	}, {
+		name: "a bare list stays one array",
+		path: grpcServerPath(nil),
+		enc:  gnmipb.Encoding_JSON_IETF,
+	}, {
+		name: "a concrete key is served as asked",
+		path: grpcServerPath(map[string]string{"name": "gnxi"}),
+		enc:  gnmipb.Encoding_JSON_IETF,
+	}, {
+		name: "a node below the list is not this case",
+		path: grpcServerPath(map[string]string{"name": "*"}, "state"),
+		enc:  gnmipb.Encoding_JSON_IETF,
+	}, {
+		name: "proto encoding is left alone",
+		path: grpcServerPath(map[string]string{"name": "*"}),
+		enc:  gnmipb.Encoding_PROTO,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payload := tt.payload
+			if payload == nil {
+				payload = jsonIetf(grpcServerListPayload)
+			}
+			values, expanded := expandWildcardListTarget(prefix, tt.path, tt.enc, payload)
+			if expanded != tt.wantExpanded {
+				t.Errorf("expandWildcardListTarget() expanded = %v, want %v", expanded, tt.wantExpanded)
+			}
+			got := updatesOf(t, values)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("expandWildcardListTarget() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// An identityref key comes back from translib qualified with its module, the
+// way RFC 7951 writes it, but a path key names the bare identity. Other keys
+// keep any colon they hold, as an IPv6 address does.
+func TestExpandWildcardListTargetKeys(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    *gnmipb.Path
+		payload string
+		want    map[string]string
+	}{{
+		name: "an identityref key reached through a leafref loses its module",
+		path: &gnmipb.Path{Elem: []*gnmipb.PathElem{
+			{Name: "acl"}, {Name: "acl-sets"},
+			{Name: "acl-set", Key: map[string]string{"name": "*", "type": "*"}},
+		}},
+		payload: `{"openconfig-acl:acl-set":[{"name":"A1","type":"openconfig-acl:ACL_IPV4","config":{"name":"A1"}}]}`,
+		want:    map[string]string{"name": "A1", "type": "ACL_IPV4"},
+	}, {
+		name: "an address key keeps its colons",
+		path: &gnmipb.Path{Elem: []*gnmipb.PathElem{
+			{Name: "system"}, {Name: "ntp"}, {Name: "servers"},
+			{Name: "server", Key: map[string]string{"address": "*"}},
+		}},
+		payload: `{"openconfig-system:server":[{"address":"fe80::1","config":{"address":"fe80::1"}}]}`,
+		want:    map[string]string{"address": "fe80::1"},
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values, expanded := expandWildcardListTarget(&gnmipb.Path{}, tt.path, gnmipb.Encoding_JSON_IETF, jsonIetf(tt.payload))
+			if !expanded || len(values) != 1 {
+				t.Fatalf("expandWildcardListTarget() = %v, %v; want one update", values, expanded)
+			}
+			elems := values[0].GetPath().GetElem()
+			if got := elems[len(elems)-1].GetKey(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("keys = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // The request path must survive expansion: it is reused for every instance and
 // is a map key in path2URI.
 func TestExpandListFallbackLeavesRequestPathAlone(t *testing.T) {
