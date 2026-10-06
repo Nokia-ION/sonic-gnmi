@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/Azure/sonic-mgmt-common/translib/ocbinds"
 	pathutil "github.com/Azure/sonic-mgmt-common/translib/path"
 	"github.com/Workiva/go-datastructures/queue"
 	log "github.com/golang/glog"
@@ -207,7 +208,11 @@ func processGetWorker(pathChan <-chan pathFromGetReq, valueChan chan<- *spb.Valu
 			// An expansion that matched no instance still answers the request:
 			// the list stood in for a node none of its instances carry, so the
 			// answer is no updates rather than the list itself.
-			if instances, expanded := expandListFallback(path.c.prefix, path.path, path.c.encoding, resp, val); expanded {
+			instances, expanded := expandListFallback(path.c.prefix, path.path, path.c.encoding, resp, val)
+			if !expanded {
+				instances, expanded = expandWildcardListTarget(path.c.prefix, path.path, path.c.encoding, val)
+			}
+			if expanded {
 				for _, v := range instances {
 					valueChan <- v
 				}
@@ -840,10 +845,59 @@ func expandListFallback(prefix, path *gnmipb.Path, enc gnmipb.Encoding,
 		return nil, false
 	}
 
-	entries, ok := listEntriesFromPayload(typedVal, listElem.GetName())
+	return expandListInstances(prefix, path, enc, depth, keyNames, remainder, typedVal)
+}
+
+// expandWildcardListTarget splits the payload of a request that ends at a list
+// with every key wildcarded into one update per instance, each addressed by its
+// keys. translib serves such a request as the keyless list, which it answers
+// as one array; a "*" means each instance, and an update path cannot carry a
+// wildcard, so the array is split here.
+//
+// A bare list at the end of the path is left as one array, which is what the
+// translib client has always returned for it.
+func expandWildcardListTarget(prefix, path *gnmipb.Path, enc gnmipb.Encoding,
+	typedVal *gnmipb.TypedValue) ([]*spb.Value, bool) {
+
+	if typedVal == nil {
+		return nil, false
+	}
+	if enc != gnmipb.Encoding_JSON && enc != gnmipb.Encoding_JSON_IETF {
+		return nil, false
+	}
+	elems := path.GetElem()
+	if len(elems) == 0 {
+		return nil, false
+	}
+	last := elems[len(elems)-1]
+	if len(last.GetKey()) == 0 {
+		return nil, false
+	}
+	keyNames := make([]string, 0, len(last.GetKey()))
+	for name, value := range last.GetKey() {
+		if value != "*" {
+			return nil, false
+		}
+		keyNames = append(keyNames, name)
+	}
+
+	return expandListInstances(prefix, path, enc, len(elems), keyNames, nil, typedVal)
+}
+
+// expandListInstances turns the list payload for the list at path element
+// depth-1 into one update per instance, carrying the node remainder names
+// below each instance, or the instance itself when remainder is empty.
+// Instances that do not carry that node are left out.
+func expandListInstances(prefix, path *gnmipb.Path, enc gnmipb.Encoding, depth int,
+	keyNames []string, remainder []*gnmipb.PathElem, typedVal *gnmipb.TypedValue) ([]*spb.Value, bool) {
+
+	listElem := path.GetElem()[depth-1]
+	entries, ok := listEntriesFromPayload(typedVal, unprefixed(listElem.GetName()))
 	if !ok {
 		return nil, false
 	}
+
+	identityKeys := identityrefKeys(path.GetElem()[:depth], keyNames)
 
 	values := make([]*spb.Value, 0, len(entries))
 	for _, entry := range entries {
@@ -862,13 +916,22 @@ func expandListFallback(prefix, path *gnmipb.Path, enc gnmipb.Encoding,
 			if !ok {
 				return nil, false
 			}
+			// RFC 7951 qualifies an identity with its module, a path key
+			// does not.
+			if identityKeys[name] {
+				if i := strings.IndexByte(key, ':'); i >= 0 {
+					key = key[i+1:]
+				}
+			}
 			keys[name] = key
 		}
 
-		node, found := jsonNodeAt(fields, remainder)
-		if !found {
-			// This instance does not carry the node that was asked for.
-			continue
+		node := json.RawMessage(entry)
+		if len(remainder) != 0 {
+			var found bool
+			if node, found = jsonNodeAt(fields, remainder); !found {
+				continue
+			}
 		}
 
 		instance := proto.Clone(path).(*gnmipb.Path)
@@ -885,8 +948,59 @@ func expandListFallback(prefix, path *gnmipb.Path, enc gnmipb.Encoding,
 	return values, true
 }
 
+// identityrefKeys reports which of keyNames are identityref keys of the list
+// that elems name, directly or through a leafref to a sibling leaf such as
+// acl-set's type, which points at config/type. Their RFC 7951 values carry a
+// module prefix; a key cannot be told apart from an IPv6 address by its text,
+// so the schema decides.
+func identityrefKeys(elems []*gnmipb.PathElem, keyNames []string) map[string]bool {
+	entry := ocbinds.SchemaTree["Device"]
+	for _, e := range elems {
+		if entry == nil {
+			return nil
+		}
+		entry = entry.Dir[unprefixed(e.GetName())]
+	}
+	if entry == nil || !entry.IsList() {
+		return nil
+	}
+
+	res := make(map[string]bool)
+	for _, name := range keyNames {
+		leaf := entry.Dir[name]
+		// Follow at most a short chain of leafrefs relative to the list.
+		for i := 0; i < 4 && leaf != nil && leaf.Type != nil; i++ {
+			kind := leaf.Type.Kind.String()
+			if kind == "identityref" {
+				res[name] = true
+				break
+			}
+			if kind != "leafref" || !strings.HasPrefix(leaf.Type.Path, "../") ||
+				strings.HasPrefix(leaf.Type.Path, "../../") {
+				break
+			}
+			target := entry
+			for _, part := range strings.Split(strings.TrimPrefix(leaf.Type.Path, "../"), "/") {
+				if target == nil {
+					break
+				}
+				target = target.Dir[unprefixed(part)]
+			}
+			leaf = target
+		}
+	}
+	return res
+}
+
+func unprefixed(name string) string {
+	if i := strings.IndexByte(name, ':'); i >= 0 {
+		return name[i+1:]
+	}
+	return name
+}
+
 // listEntriesFromPayload unwraps the RFC 7951 object a list payload arrives in
-// and returns its entries.
+// and returns its entries. An empty object is a list with no instances.
 func listEntriesFromPayload(typedVal *gnmipb.TypedValue, listName string) ([]json.RawMessage, bool) {
 	raw := typedVal.GetJsonIetfVal()
 	if len(raw) == 0 {
@@ -898,6 +1012,9 @@ func listEntriesFromPayload(typedVal *gnmipb.TypedValue, listName string) ([]jso
 	var wrapper map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &wrapper); err != nil {
 		return nil, false
+	}
+	if len(wrapper) == 0 {
+		return nil, true
 	}
 	inner, ok := jsonField(wrapper, listName)
 	if !ok {
