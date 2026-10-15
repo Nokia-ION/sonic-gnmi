@@ -942,6 +942,71 @@ func TestExpandListFallback(t *testing.T) {
 	}
 }
 
+// A keyed list below the wildcarded one selects the entry with those keys in
+// each instance.
+func TestExpandListFallbackKeyedInnerList(t *testing.T) {
+	const payload = `{"openconfig-platform:component":[` +
+		`{"name":"MB Left","properties":{"property":[` +
+		`{"name":"active","state":{"name":"active","value":true}},` +
+		`{"name":"temperature","state":{"name":"temperature","value":"27"}}]}},` +
+		`{"name":"Fan1","properties":{"property":[{"name":"active","state":{"name":"active","value":true}}]}},` +
+		`{"name":"PSU1","state":{"name":"PSU1"}}]}`
+	resp := &translib.GetResponse{ServedPath: "/openconfig-platform:components/component", ServedListKeys: []string{"name"}}
+
+	componentPath := func(propKeys map[string]string, rest ...string) *gnmipb.Path {
+		elems := []*gnmipb.PathElem{
+			{Name: "openconfig-platform:components"},
+			{Name: "component", Key: map[string]string{"name": "*"}},
+			{Name: "properties"},
+			{Name: "property", Key: propKeys},
+		}
+		for _, r := range rest {
+			elems = append(elems, &gnmipb.PathElem{Name: r})
+		}
+		return &gnmipb.Path{Elem: elems}
+	}
+
+	tests := []struct {
+		name string
+		path *gnmipb.Path
+		want []update
+	}{{
+		name: "a leaf below a keyed entry answers for the instances carrying it",
+		path: componentPath(map[string]string{"name": "temperature"}, "state", "value"),
+		want: []update{{key: "MB Left", json: `"27"`}},
+	}, {
+		name: "every instance carrying the entry answers",
+		path: componentPath(map[string]string{"name": "active"}, "state", "value"),
+		want: []update{{key: "MB Left", json: `true`}, {key: "Fan1", json: `true`}},
+	}, {
+		name: "a path ending at the keyed entry carries the entry",
+		path: componentPath(map[string]string{"name": "temperature"}),
+		want: []update{{key: "MB Left", json: `{"name":"temperature","state":{"name":"temperature","value":"27"}}`}},
+	}, {
+		name: "no instance carrying the entry answers with nothing",
+		path: componentPath(map[string]string{"name": "absent"}, "state", "value"),
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values, expanded := expandListFallback(&gnmipb.Path{}, tt.path, gnmipb.Encoding_JSON_IETF, resp, jsonIetf(payload))
+			if !expanded {
+				t.Fatalf("expandListFallback() expanded = false, want true")
+			}
+			var got []update
+			for _, v := range values {
+				got = append(got, update{
+					key:  v.GetPath().GetElem()[1].GetKey()["name"],
+					json: string(v.GetVal().GetJsonIetfVal()),
+				})
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("expandListFallback() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestExpandWildcardListTarget(t *testing.T) {
 	prefix := &gnmipb.Path{}
 
