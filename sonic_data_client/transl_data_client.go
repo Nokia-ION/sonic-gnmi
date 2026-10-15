@@ -1028,12 +1028,17 @@ func listEntriesFromPayload(typedVal *gnmipb.TypedValue, listName string) ([]jso
 }
 
 // jsonNodeAt walks elems through a decoded RFC 7951 object and returns the
-// node they name.
+// node they name. An element with keys names the list entry carrying them.
 func jsonNodeAt(fields map[string]json.RawMessage, elems []*gnmipb.PathElem) (json.RawMessage, bool) {
 	for i, e := range elems {
 		raw, ok := jsonField(fields, e.GetName())
 		if !ok {
 			return nil, false
+		}
+		if len(e.GetKey()) != 0 {
+			if raw, ok = jsonListEntry(raw, e.GetKey()); !ok {
+				return nil, false
+			}
 		}
 		if i == len(elems)-1 {
 			return raw, true
@@ -1043,6 +1048,37 @@ func jsonNodeAt(fields map[string]json.RawMessage, elems []*gnmipb.PathElem) (js
 			return nil, false
 		}
 		fields = next
+	}
+	return nil, false
+}
+
+// jsonListEntry returns the entry of an RFC 7951 list whose key leaves hold
+// the given values.
+func jsonListEntry(list json.RawMessage, keys map[string]string) (json.RawMessage, bool) {
+	var entries []json.RawMessage
+	if err := json.Unmarshal(list, &entries); err != nil {
+		return nil, false
+	}
+	for _, entry := range entries {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(entry, &fields); err != nil {
+			return nil, false
+		}
+		match := true
+		for name, want := range keys {
+			raw, found := jsonField(fields, name)
+			if !found {
+				match = false
+				break
+			}
+			if got, ok := jsonScalarString(raw); !ok || got != want {
+				match = false
+				break
+			}
+		}
+		if match {
+			return entry, true
+		}
 	}
 	return nil, false
 }
