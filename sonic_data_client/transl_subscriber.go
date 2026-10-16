@@ -323,6 +323,15 @@ func strSliceContains(ss []string, v string) bool {
 	return false
 }
 
+func hasWildcardKey(e *gnmipb.PathElem) bool {
+	for _, v := range e.GetKey() {
+		if v == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 // ygotCache holds path to ygot struct mappings
 type ygotCache struct {
 	values  map[string]ygot.GoStruct
@@ -408,8 +417,13 @@ func (c *ygotCache) toDeletePath(path string) *gnmipb.Path {
 	// p will be parent container path when subscribing to a leaf.
 	// Append the leaf suffix to p if p is shorter than subscribe path.
 	// Copy elems so later module-prefix stripping cannot mutate the cache pattern.
+	// A delete path names concrete nodes, so the suffix stops at a wildcarded
+	// list; p then names the node that held every instance of it.
 	if n := len(p.Elem); n < len(c.pattern.Elem) {
 		for _, e := range c.pattern.Elem[n:] {
+			if hasWildcardKey(e) {
+				break
+			}
 			ne := &gnmipb.PathElem{Name: e.Name, Key: e.Key}
 			p.Elem = append(p.Elem, ne)
 		}
