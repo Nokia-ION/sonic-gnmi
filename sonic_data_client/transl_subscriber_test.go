@@ -6,6 +6,7 @@ import (
 	"github.com/Azure/sonic-mgmt-common/translib"
 	"github.com/Workiva/go-datastructures/queue"
 	spb "github.com/openconfig/gnmi/proto/gnmi"
+	"github.com/openconfig/ygot/ygot"
 )
 
 func TestToPrefix_OpenConfigStripsModulePrefix(t *testing.T) {
@@ -168,6 +169,127 @@ func TestNotifyNil(t *testing.T) {
 
 			// Execute
 			ts.notify(tt.v)
+		})
+	}
+}
+
+func mustPath(t *testing.T, s string) *spb.Path {
+	t.Helper()
+	p, err := ygot.StringToStructuredPath(s)
+	if err != nil {
+		t.Fatalf("bad path %q: %v", s, err)
+	}
+	return p
+}
+
+func pathStrings(t *testing.T, msg *spb.Notification) (updates, deletes []string) {
+	t.Helper()
+	for _, u := range msg.Update {
+		s, _ := ygot.PathToString(u.Path)
+		updates = append(updates, s)
+	}
+	for _, d := range msg.Delete {
+		s, _ := ygot.PathToString(d)
+		deletes = append(deletes, s)
+	}
+	return
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestFilterFanout(t *testing.T) {
+	const props = "/components/component[name=Fan1]/properties"
+	tests := []struct {
+		name        string
+		pattern     string
+		prefix      string
+		updates     []string
+		deletes     []string
+		wantUpdates []string
+		wantDeletes []string
+	}{{
+		name:        "leaf under wildcard drops key leaf",
+		pattern:     "/openconfig-platform:components/component[name=Fan1]/properties/property[name=*]/state/value",
+		prefix:      props,
+		updates:     []string{"/property[name=speed]/name", "/property[name=speed]/state/value"},
+		deletes:     []string{"/property[name=gone]", "/property[name=gone]/name"},
+		wantUpdates: []string{"/property[name=speed]/state/value"},
+		wantDeletes: []string{"/property[name=gone]"},
+	}, {
+		name:        "pattern ends at list keeps key leaf",
+		pattern:     "/openconfig-platform:components/component[name=Fan1]/properties/property[name=*]",
+		prefix:      props,
+		updates:     []string{"/property[name=speed]/name", "/property[name=speed]/state/value"},
+		wantUpdates: []string{"/property[name=speed]/name", "/property[name=speed]/state/value"},
+	}, {
+		name:        "pattern names key leaf",
+		pattern:     "/openconfig-platform:components/component[name=Fan1]/properties/property[name=*]/name",
+		prefix:      props,
+		updates:     []string{"/property[name=speed]/name", "/property[name=speed]/state/value"},
+		wantUpdates: []string{"/property[name=speed]/name"},
+	}, {
+		name:        "two wildcards with module prefixed response",
+		pattern:     "/openconfig-platform:components/component[name=*]/properties/property[name=*]/state/value",
+		prefix:      "/openconfig-platform:components/component[name=Fan1]/properties",
+		updates:     []string{"/property[name=speed]/name", "/property[name=speed]/state/value"},
+		wantUpdates: []string{"/property[name=speed]/state/value"},
+	}, {
+		name:        "replace below a shortened prefix",
+		pattern:     "/openconfig-platform:components/component[name=Fan1]/properties/property[name=*]/state/value",
+		prefix:      "/components/component[name=Fan1]",
+		updates:     []string{"/properties/property[name=speed]/name", "/properties/property[name=speed]/state/value"},
+		deletes:     []string{"/properties"},
+		wantUpdates: []string{"/properties/property[name=speed]/state/value"},
+		wantDeletes: []string{"/properties"},
+	}, {
+		name:        "sample delete from root prefix",
+		pattern:     "/openconfig-platform:components/component[name=*]/properties/property[name=*]/state/value",
+		prefix:      "/",
+		deletes:     []string{"/components/component[name=Fan1]/properties", "/components/component[name=Fan1]/name"},
+		wantDeletes: []string{"/components/component[name=Fan1]/properties"},
+	}, {
+		name:        "prefix below the wildcards is left alone",
+		pattern:     "/openconfig-interfaces:interfaces/interface[name=*]/state",
+		prefix:      "/interfaces/interface[name=Ethernet0]/state",
+		updates:     []string{"/oper-status", "/admin-status"},
+		wantUpdates: []string{"/oper-status", "/admin-status"},
+	}, {
+		name:        "other component is not filtered",
+		pattern:     "/openconfig-platform:components/component[name=Fan1]/properties/property[name=*]/state/value",
+		prefix:      "/components/component[name=Fan2]/properties",
+		updates:     []string{"/property[name=speed]/name"},
+		wantUpdates: []string{"/property[name=speed]/name"},
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := &translSubscriber{}
+			ts.setPatterns([]string{tt.pattern})
+			msg := &spb.Notification{Prefix: mustPath(t, tt.prefix)}
+			for _, u := range tt.updates {
+				msg.Update = append(msg.Update, &spb.Update{Path: mustPath(t, u)})
+			}
+			for _, d := range tt.deletes {
+				msg.Delete = append(msg.Delete, mustPath(t, d))
+			}
+			ts.filterFanout(msg)
+			gotU, gotD := pathStrings(t, msg)
+			if !sameStrings(gotU, tt.wantUpdates) {
+				t.Errorf("updates: got %v, want %v", gotU, tt.wantUpdates)
+			}
+			if !sameStrings(gotD, tt.wantDeletes) {
+				t.Errorf("deletes: got %v, want %v", gotD, tt.wantDeletes)
+			}
 		})
 	}
 }
