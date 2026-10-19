@@ -21,6 +21,7 @@ package client
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ type translSubscriber struct {
 	rcvdPaths   map[string]bool // Paths from received SubscribeResponse
 	msgBuilder  notificationBuilder
 	sampleWg    *sync.WaitGroup // WaitGroup to indicate when Sample subscriptions have finished processing
+	patterns    []*gnmipb.Path  // Subscribed paths without module prefixes; see filterFanout
 }
 
 // notificationBuilder creates gnmipb.Notification from a translib.SubscribeResponse
@@ -62,6 +64,7 @@ func (ts *translSubscriber) doSample(path string) {
 	} else {
 		ts.msgBuilder = defaultMsgBuilder // ONCE, POLL or heartbeat for ON_CHANGE
 	}
+	ts.setPatterns([]string{path})
 
 	c := ts.client
 	req := translib.SubscribeRequest{
@@ -106,6 +109,7 @@ func (ts *translSubscriber) doOnChange(stringPaths []string) {
 	c.w.Add(1)
 	ts.synced.Add(1)
 	ts.msgBuilder = defaultMsgBuilder
+	ts.setPatterns(stringPaths)
 	go ts.processResponses(q)
 
 	err := translib.Subscribe(req)
@@ -185,6 +189,7 @@ func (ts *translSubscriber) notify(v *translib.SubscribeResponse) error {
 	if err != nil {
 		return err
 	}
+	ts.filterFanout(msg)
 
 	if msg == nil || (len(msg.Update) == 0 && len(msg.Delete) == 0) {
 		log.V(6).Infof("Ignore nil message")
@@ -330,6 +335,107 @@ func hasWildcardKey(e *gnmipb.PathElem) bool {
 		}
 	}
 	return false
+}
+
+func (ts *translSubscriber) setPatterns(paths []string) {
+	ts.patterns = nil
+	for _, s := range paths {
+		p, err := ygot.StringToStructuredPath(s)
+		if err != nil {
+			continue
+		}
+		pathutil.RemoveModulePrefix(p)
+		ts.patterns = append(ts.patterns, p)
+	}
+}
+
+// filterFanout drops the updates and deletes of msg that fall outside the
+// subscribed path when msg's prefix sits above a wildcarded list of that path.
+// translib answers such a path with the node above the list, and every list
+// entry in it carries its key leaves, which ygot needs to render the entry
+// even when the path does not ask for them.
+func (ts *translSubscriber) filterFanout(msg *gnmipb.Notification) {
+	if msg == nil {
+		return
+	}
+	var rels [][]*gnmipb.PathElem
+	for _, pat := range ts.patterns {
+		if rel := fanoutSuffix(msg.Prefix, pat); rel != nil {
+			rels = append(rels, rel)
+		}
+	}
+	if len(rels) == 0 {
+		return
+	}
+
+	var updates []*gnmipb.Update
+	for _, u := range msg.Update {
+		if matchesAnyPattern(u.GetPath(), rels, false) {
+			updates = append(updates, u)
+		}
+	}
+	var deletes []*gnmipb.Path
+	for _, d := range msg.Delete {
+		if matchesAnyPattern(d, rels, true) {
+			deletes = append(deletes, d)
+		}
+	}
+	msg.Update, msg.Delete = updates, deletes
+}
+
+// fanoutSuffix returns the part of pat below prefix when prefix lines up with
+// pat and that part has a wildcarded list; nil otherwise.
+func fanoutSuffix(prefix, pat *gnmipb.Path) []*gnmipb.PathElem {
+	pe := prefix.GetElem()
+	if len(pe) >= len(pat.GetElem()) || !elemsMatch(pe, pat.Elem[:len(pe)]) {
+		return nil
+	}
+	rel := pat.Elem[len(pe):]
+	for _, e := range rel {
+		if hasWildcardKey(e) {
+			return rel
+		}
+	}
+	return nil
+}
+
+// matchesAnyPattern reports whether p is at or below one of the patterns.
+// With ancestors set, a p above a pattern matches too, which lets a delete
+// of a whole list entry through.
+func matchesAnyPattern(p *gnmipb.Path, patterns [][]*gnmipb.PathElem, ancestors bool) bool {
+	pe := p.GetElem()
+	for _, pat := range patterns {
+		if len(pe) >= len(pat) && elemsMatch(pe[:len(pat)], pat) {
+			return true
+		}
+		if ancestors && len(pe) < len(pat) && elemsMatch(pe, pat[:len(pe)]) {
+			return true
+		}
+	}
+	return false
+}
+
+// elemsMatch compares elems against pattern elems of the same length. Module
+// prefixes are ignored and a "*" key in the pattern matches any value.
+func elemsMatch(elems, pattern []*gnmipb.PathElem) bool {
+	for i, e := range elems {
+		if unprefixedName(e.GetName()) != unprefixedName(pattern[i].GetName()) {
+			return false
+		}
+		for k, v := range pattern[i].GetKey() {
+			if v != "*" && e.GetKey()[k] != v {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func unprefixedName(name string) string {
+	if i := strings.IndexByte(name, ':'); i >= 0 {
+		return name[i+1:]
+	}
+	return name
 }
 
 // ygotCache holds path to ygot struct mappings
