@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/Azure/sonic-mgmt-common/translib"
+	"github.com/Azure/sonic-mgmt-common/translib/ocbinds"
 	"github.com/Workiva/go-datastructures/queue"
 	"github.com/golang/protobuf/proto"
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
@@ -1123,5 +1124,77 @@ func TestExpandListFallbackLeavesRequestPathAlone(t *testing.T) {
 
 	if !proto.Equal(before, path) {
 		t.Errorf("request path was modified: got %v, want %v", path, before)
+	}
+}
+
+func TestNewTranslClientEncodingOption(t *testing.T) {
+	client, err := NewTranslClient(nil, nil, context.Background(), nil,
+		TranslEncodingOption{Encoding: gnmipb.Encoding_PROTO})
+	if err != nil {
+		t.Fatalf("NewTranslClient() error = %v", err)
+	}
+	if got := client.(*TranslClient).encoding; got != gnmipb.Encoding_PROTO {
+		t.Errorf("encoding = %v, want %v", got, gnmipb.Encoding_PROTO)
+	}
+}
+
+// A PROTO Get answers a leaf with its scalar TypedValue, not RFC 7951 JSON.
+func TestTranslClientGetProtoLeaf(t *testing.T) {
+	originalFunc := translProcessGetFunc
+	defer func() { translProcessGetFunc = originalFunc }()
+
+	var gotEnc gnmipb.Encoding
+	translProcessGetFunc = func(uriPath string, op *string, ctx context.Context, encoding gnmipb.Encoding) (*gnmipb.TypedValue, *translib.GetResponse, error) {
+		gotEnc = encoding
+		// translib answers a leaf with its parent holding only that leaf.
+		return nil, &translib.GetResponse{ValueTree: &ocbinds.OpenconfigInterfaces_Interfaces_Interface_State{
+			OperStatus: ocbinds.OpenconfigInterfaces_Interfaces_Interface_State_OperStatus_UP,
+		}}, nil
+	}
+
+	prefix := &gnmipb.Path{Origin: "openconfig", Target: "dut"}
+	path := &gnmipb.Path{Elem: []*gnmipb.PathElem{
+		{Name: "interfaces"},
+		{Name: "interface", Key: map[string]string{"name": "Ethernet0"}},
+		{Name: "state"},
+		{Name: "oper-status"},
+	}}
+	c := &TranslClient{
+		prefix:   prefix,
+		path2URI: map[*gnmipb.Path]string{path: "/openconfig-interfaces:interfaces/interface[name=Ethernet0]/state/oper-status"},
+		ctx:      context.Background(),
+		encoding: gnmipb.Encoding_PROTO,
+	}
+
+	values, err := c.Get(nil)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if gotEnc != gnmipb.Encoding_PROTO {
+		t.Errorf("translib asked for %v, want %v", gotEnc, gnmipb.Encoding_PROTO)
+	}
+	if len(values) != 1 {
+		t.Fatalf("Get() returned %d values, want 1", len(values))
+	}
+	n := values[0].GetNotification()
+	if n == nil {
+		t.Fatalf("Get() value carries no notification: %v", values[0])
+	}
+	if got := n.GetPrefix().GetTarget(); got != "dut" {
+		t.Errorf("prefix target = %q, want %q", got, "dut")
+	}
+	wantPrefix := &gnmipb.Path{Elem: path.Elem[:3]}
+	if got := (&gnmipb.Path{Elem: n.GetPrefix().GetElem()}); !proto.Equal(got, wantPrefix) {
+		t.Errorf("prefix elems = %v, want %v", got, wantPrefix)
+	}
+	if len(n.GetUpdate()) != 1 {
+		t.Fatalf("notification has %d updates, want 1: %v", len(n.GetUpdate()), n)
+	}
+	u := n.GetUpdate()[0]
+	if got := u.GetPath().GetElem(); len(got) != 1 || got[0].GetName() != "oper-status" {
+		t.Errorf("update path = %v, want oper-status", u.GetPath())
+	}
+	if got := u.GetVal().GetStringVal(); got != "UP" {
+		t.Errorf("update value = %v, want string_val UP", u.GetVal())
 	}
 }
