@@ -39,6 +39,7 @@ const (
 var useParallelProcessing = flag.Bool("use_parallel_processing", false, "use parallel processing for GET/SUBSCRIBE requests")
 var translProcessGetFunc = transutil.TranslProcessGet
 var isSubscribeSupportedFunc = translib.IsSubscribeSupported
+var translibSubscribeFunc = translib.Subscribe
 
 type TranslClient struct {
 	prefix *gnmipb.Path
@@ -524,7 +525,8 @@ func (c *TranslClient) StreamRun(q *queue.PriorityQueue, stop chan struct{}, w *
 			filterMsgs: subscribe.UpdatesOnly,
 			sampleWg:   wg,
 		}
-		ts.doOnChange(onChangeSubsString)
+		onChangeQ := ts.doOnChange(onChangeSubsString)
+		defer onChangeQ.Dispose()
 	} else {
 		// If at least one ON_CHANGE subscription was present, then
 		// ts.doOnChange() would have sent the sync message.
