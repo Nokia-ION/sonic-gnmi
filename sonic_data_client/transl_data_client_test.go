@@ -12,6 +12,7 @@ import (
 	"github.com/openconfig/ygot/ygot"
 	spb "github.com/sonic-net/sonic-gnmi/proto"
 	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -1196,5 +1197,98 @@ func TestTranslClientGetProtoLeaf(t *testing.T) {
 	}
 	if got := u.GetVal().GetStringVal(); got != "UP" {
 		t.Errorf("update value = %v, want string_val UP", u.GetVal())
+	}
+}
+
+// When translib serves the list in place of a wildcarded leaf below it, a PROTO
+// Get answers with that leaf of each instance and nothing else of the list.
+func TestTranslClientGetProtoListFallback(t *testing.T) {
+	originalFunc := translProcessGetFunc
+	defer func() { translProcessGetFunc = originalFunc }()
+
+	interfaces := func() *ocbinds.OpenconfigInterfaces_Interfaces {
+		ifs := &ocbinds.OpenconfigInterfaces_Interfaces{}
+		for _, name := range []string{"Ethernet0", "Ethernet8"} {
+			i, err := ifs.NewInterface(name)
+			if err != nil {
+				t.Fatalf("NewInterface(%s) error = %v", name, err)
+			}
+			i.State = &ocbinds.OpenconfigInterfaces_Interfaces_Interface_State{
+				Name:       ygot.String(name),
+				Mtu:        ygot.Uint16(9100),
+				OperStatus: ocbinds.OpenconfigInterfaces_Interfaces_Interface_State_OperStatus_UP,
+			}
+		}
+		return ifs
+	}
+
+	tests := []struct {
+		name     string
+		leaf     string
+		keys     map[string]string
+		wantKeys []string
+	}{{
+		name:     "wildcarded list",
+		leaf:     "oper-status",
+		keys:     map[string]string{"name": "*"},
+		wantKeys: []string{"Ethernet0", "Ethernet8"},
+	}, {
+		name:     "unkeyed list",
+		leaf:     "oper-status",
+		wantKeys: []string{"Ethernet0", "Ethernet8"},
+	}, {
+		name: "no instance carries the leaf",
+		leaf: "description",
+		keys: map[string]string{"name": "*"},
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			translProcessGetFunc = func(uriPath string, op *string, ctx context.Context, encoding gnmipb.Encoding) (*gnmipb.TypedValue, *translib.GetResponse, error) {
+				return nil, &translib.GetResponse{
+					ValueTree:      interfaces(),
+					ServedPath:     "/openconfig-interfaces:interfaces/interface",
+					ServedListKeys: []string{"name"},
+				}, nil
+			}
+			path := &gnmipb.Path{Elem: []*gnmipb.PathElem{
+				{Name: "interfaces"},
+				{Name: "interface", Key: tt.keys},
+				{Name: "state"},
+				{Name: tt.leaf},
+			}}
+			c := &TranslClient{
+				prefix:   &gnmipb.Path{Origin: "openconfig"},
+				path2URI: map[*gnmipb.Path]string{path: "/openconfig-interfaces:interfaces/interface/state/" + tt.leaf},
+				ctx:      context.Background(),
+				encoding: gnmipb.Encoding_PROTO,
+			}
+
+			values, err := c.Get(nil)
+			if err != nil {
+				t.Fatalf("Get() error = %v", err)
+			}
+			var gotKeys []string
+			for _, v := range values {
+				for _, u := range v.GetNotification().GetUpdate() {
+					elems := u.GetPath().GetElem()
+					if len(elems) != 3 || elems[1].GetName() != "state" || elems[2].GetName() != tt.leaf {
+						t.Errorf("unexpected update %v", u.GetPath())
+						continue
+					}
+					if got := u.GetVal().GetStringVal(); got != "UP" {
+						t.Errorf("update %v value = %v, want string_val UP", u.GetPath(), u.GetVal())
+					}
+					gotKeys = append(gotKeys, elems[0].GetKey()["name"])
+				}
+			}
+			sort.Strings(gotKeys)
+			if !reflect.DeepEqual(gotKeys, tt.wantKeys) {
+				t.Errorf("instances answered = %v, want %v", gotKeys, tt.wantKeys)
+			}
+			if len(tt.wantKeys) == 0 && len(values) != 0 {
+				t.Errorf("Get() returned %d values, want none", len(values))
+			}
+		})
 	}
 }
