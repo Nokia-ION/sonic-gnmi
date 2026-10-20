@@ -232,9 +232,55 @@ func processGetWorker(pathChan <-chan pathFromGetReq, valueChan chan<- *spb.Valu
 			errChan <- err
 			return
 		}
+		// A list that stood in for the request carries every instance whole,
+		// so PROTO keeps only the leaves under the path asked for. As with
+		// JSON, an answer left with nothing is no update at all.
+		if n := v.GetNotification(); n != nil && len(n.GetUpdate()) != 0 {
+			n.Update = updatesUnderPath(path.c.prefix, path.path, n)
+			if len(n.Update) == 0 && respPath != path.path {
+				continue
+			}
+		}
 
 		valueChan <- v
 	}
+}
+
+// updatesUnderPath returns the updates of n that sit at or below the request
+// path. A wildcarded or unkeyed list in the request matches every instance.
+func updatesUnderPath(prefix, path *gnmipb.Path, n *gnmipb.Notification) []*gnmipb.Update {
+	want := append(append([]*gnmipb.PathElem{}, prefix.GetElem()...), path.GetElem()...)
+	kept := n.Update[:0]
+	for _, u := range n.Update {
+		got := append(append([]*gnmipb.PathElem{}, n.GetPrefix().GetElem()...), u.GetPath().GetElem()...)
+		if pathElemsCover(want, got) {
+			kept = append(kept, u)
+		}
+	}
+	return kept
+}
+
+// pathElemsCover reports whether got is want or a node below it.
+func pathElemsCover(want, got []*gnmipb.PathElem) bool {
+	if len(got) < len(want) {
+		return false
+	}
+	for i, w := range want {
+		g := got[i]
+		if unprefixed(w.GetName()) != unprefixed(g.GetName()) {
+			return false
+		}
+		for k, wv := range w.GetKey() {
+			if wv == "*" {
+				continue
+			}
+			gv, ok := g.GetKey()[k]
+			if !ok || (gv != wv && gv != unprefixed(wv)) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (c *TranslClient) Set(delete []*gnmipb.Path, replace []*gnmipb.Update, update []*gnmipb.Update) error {
