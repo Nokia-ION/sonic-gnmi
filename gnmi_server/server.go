@@ -1344,7 +1344,8 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 			authTarget = "gnmi_" + targetDbName
 		} else {
 			prefix = prefixWithOrigin(prefix, origin)
-			dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions)
+			dc, err = sdc.NewTranslClient(prefix, paths, ctx, extensions,
+				sdc.TranslEncodingOption{Encoding: encoding})
 		}
 	}
 
@@ -1386,6 +1387,19 @@ func (s *Server) Get(ctx context.Context, req *gnmipb.GetRequest) (*gnmipb.GetRe
 
 	notifications := make([]*gnmipb.Notification, 0, len(spbValues))
 	for _, spbValue := range spbValues {
+		// PROTO values arrive as whole notifications whose prefix is the
+		// parent of the scalar leaves they carry. That prefix takes its origin
+		// from the request path only, so fall back to the request prefix's.
+		if n := spbValue.GetNotification(); n != nil {
+			if n.Prefix == nil {
+				n.Prefix = &gnmipb.Path{}
+			}
+			if n.Prefix.Origin == "" {
+				n.Prefix.Origin = prefix.GetOrigin()
+			}
+			notifications = append(notifications, n)
+			continue
+		}
 		update := &gnmipb.Update{
 			Path: spbValue.GetPath(),
 			Val:  spbValue.GetVal(),
