@@ -92,7 +92,10 @@ func (ts *translSubscriber) doSample(path string) {
 
 // doOnChange handles the ON_CHANGE subscriptions through translib.Subscribe API.
 // Returns only after initial updates and sync message are sent to the RPC queue.
-func (ts *translSubscriber) doOnChange(stringPaths []string) {
+// Returns the translib response queue, which the caller must dispose when the
+// stream ends: translib never disposes it, and processResponses keeps reading
+// it (holding the client's WaitGroup) until it is disposed.
+func (ts *translSubscriber) doOnChange(stringPaths []string) *queue.PriorityQueue {
 	c := ts.client
 	q := queue.NewPriorityQueue(1, false)
 
@@ -112,13 +115,14 @@ func (ts *translSubscriber) doOnChange(stringPaths []string) {
 	ts.setPatterns(stringPaths)
 	go ts.processResponses(q)
 
-	err := translib.Subscribe(req)
+	err := translibSubscribeFunc(req)
 	if err != nil {
 		q.Dispose()
 		enqueFatalMsgTranslib(c, "Subscribe operation failed with error: "+err.Error())
 	}
 
 	ts.synced.Wait()
+	return q
 }
 
 // processResponses waits for SubscribeResponse messages from translib over a

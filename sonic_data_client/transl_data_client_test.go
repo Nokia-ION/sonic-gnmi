@@ -251,6 +251,73 @@ func TestTranslClient_StreamRun_Parallel(t *testing.T) {
 	}
 }
 
+// Every goroutine an ON_CHANGE stream adds to the client's WaitGroup has to
+// exit once the stream is stopped; the server removes the session only then.
+func TestTranslClient_StreamRun_OnChangeStop(t *testing.T) {
+	oldSubSupport, oldSubscribe := isSubscribeSupportedFunc, translibSubscribeFunc
+	defer func() { isSubscribeSupportedFunc, translibSubscribeFunc = oldSubSupport, oldSubscribe }()
+
+	path := &gnmipb.Path{Elem: []*gnmipb.PathElem{{Name: "interfaces"}}}
+	uri := "/openconfig-interfaces:interfaces"
+	isSubscribeSupportedFunc = func(req translib.IsSubscribeRequest) ([]*translib.IsSubscribeResponse, error) {
+		return []*translib.IsSubscribeResponse{{
+			ID:                  0,
+			Path:                uri,
+			IsOnChangeSupported: true,
+			PreferredType:       translib.OnChange,
+			MinInterval:         1,
+		}}, nil
+	}
+	// Like translib: send the sync, keep the queue open.
+	translibSubscribeFunc = func(req translib.SubscribeRequest) error {
+		return req.Q.Put(&translib.SubscribeResponse{SyncComplete: true})
+	}
+
+	q := queue.NewPriorityQueue(10, false)
+	stop := make(chan struct{})
+	c := &TranslClient{
+		ctx:      context.Background(),
+		path2URI: map[*gnmipb.Path]string{path: uri},
+	}
+	subList := &gnmipb.SubscriptionList{
+		Subscription: []*gnmipb.Subscription{{Path: path, Mode: gnmipb.SubscriptionMode_ON_CHANGE}},
+		Encoding:     gnmipb.Encoding_JSON_IETF,
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go c.StreamRun(q, stop, wg, subList)
+
+	got := make(chan []queue.Item, 1)
+	go func() {
+		items, _ := q.Get(1)
+		got <- items
+	}()
+	select {
+	case items := <-got:
+		if len(items) == 0 {
+			t.Fatal("client queue closed before sync response")
+		}
+		if v, ok := items[0].(Value); !ok || !v.GetSyncResponse() {
+			t.Fatalf("expected sync response, got %v", items[0])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no sync response from StreamRun")
+	}
+
+	close(stop)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ON_CHANGE goroutines still running after stop")
+	}
+}
+
 func TestTranslClient_OnceRun_Coverage(t *testing.T) {
 	// 1. Setup Flags
 	pTrue := true
