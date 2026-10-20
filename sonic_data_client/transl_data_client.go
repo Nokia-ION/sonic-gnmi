@@ -97,6 +97,11 @@ func NewTranslClient(prefix *gnmipb.Path, getpaths []*gnmipb.Path, ctx context.C
 	client.ctx = ctx
 	client.prefix = prefix
 	client.extensions = extensions
+	for _, o := range opts {
+		if e, ok := o.(TranslEncodingOption); ok {
+			client.encoding = e.Encoding
+		}
+	}
 
 	if getpaths != nil {
 		var addWildcardKeys bool
@@ -1261,3 +1266,11 @@ type TranslClientOption interface {
 type TranslWildcardOption struct{}
 
 func (t TranslWildcardOption) IsTranslClientOption() {}
+
+// TranslEncodingOption sets the encoding Get answers in. Subscribe takes its
+// encoding from the SubscriptionList instead.
+type TranslEncodingOption struct {
+	Encoding gnmipb.Encoding
+}
+
+func (t TranslEncodingOption) IsTranslClientOption() {}
