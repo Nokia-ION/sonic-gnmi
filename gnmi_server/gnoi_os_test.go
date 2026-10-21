@@ -1277,6 +1277,61 @@ func TestInstall_RecvErrorOnTransferRequest(t *testing.T) {
 	}
 }
 
+// TestInstall_AlreadyInstalledVersion: when the backend answers the
+// TransferRequest with Validated, Install sends it and ends the RPC without
+// waiting for TransferContent.
+func TestInstall_AlreadyInstalledVersion(t *testing.T) {
+	ctx := context.Background()
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(authenticate, func(_ *Config, ctx context.Context, _ string, _ bool) (context.Context, error) {
+		return ctx, nil
+	})
+
+	backendCalls := 0
+	osSrv := &OSServer{
+		Server: &Server{config: &Config{ImgDir: "/tmp"}},
+		backend: &MockOSBackend{InstallOSFunc: func(req string) (string, error) {
+			backendCalls++
+			respStr, err := json.Marshal(&ospb.InstallResponse{
+				Response: &ospb.InstallResponse_Validated{
+					Validated: &ospb.Validated{Version: "SONiC-OS-installed"},
+				},
+			})
+			return string(respStr), err
+		}},
+		ImgDir: "/tmp",
+	}
+
+	fakeStream := &fakeInstallServer{
+		sendFailAt: -1,
+		recvQueue: []*ospb.InstallRequest{
+			{
+				Request: &ospb.InstallRequest_TransferRequest{
+					TransferRequest: &ospb.TransferRequest{
+						Version: "SONiC-OS-installed",
+					},
+				},
+			},
+		},
+		ctx: ctx,
+	}
+
+	err := osSrv.Install(fakeStream)
+	if err != nil {
+		t.Fatalf("Expected Install to succeed for an installed version, got: %v", err)
+	}
+	if fakeStream.sendCount != 1 {
+		t.Fatalf("Expected exactly one response (Validated), got %d", fakeStream.sendCount)
+	}
+	if fakeStream.recvIdx != 1 {
+		t.Fatalf("Expected Install to stop reading after the TransferRequest, read %d messages", fakeStream.recvIdx)
+	}
+	if backendCalls != 1 {
+		t.Fatalf("Expected one backend call, got %d", backendCalls)
+	}
+}
+
 // TestInstall_SendErrorOnTransferReady covers line 301: Send() fails when
 // sending the TransferReady response after processing the TransferRequest.
 func TestInstall_SendErrorOnTransferReady(t *testing.T) {

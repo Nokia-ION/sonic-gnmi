@@ -309,6 +309,10 @@ func (srv *OSServer) Install(stream ospb.OS_InstallServer) error {
 		err = status.Errorf(codes.Aborted, "Failed to process TransferRequest.")
 		return err
 	}
+	if resp.GetValidated() != nil {
+		log.Infof("Install: Version %v is already installed, skipping transfer", transferReq.GetVersion())
+		return nil
+	}
 
 	imgPath := srv.getVersionPath(transferReq.GetVersion())
 	imgTransferInitiated := false
