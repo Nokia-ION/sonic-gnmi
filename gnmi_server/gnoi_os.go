@@ -5,6 +5,7 @@ import (
 	"fmt"
 	log "github.com/golang/glog"
 	ospb "github.com/openconfig/gnoi/os"
+	syspb "github.com/openconfig/gnoi/system"
 	gnoios "github.com/sonic-net/sonic-gnmi/pkg/gnoi/os"
 	ssc "github.com/sonic-net/sonic-gnmi/sonic_service_client"
 	"google.golang.org/grpc/codes"
@@ -435,6 +436,25 @@ func (srv *OSServer) Activate(ctx context.Context, req *ospb.ActivateRequest) (*
 	}
 
 	log.Infof("Successfully activated image %s", image)
+
+	if !req.GetNoReboot() {
+		log.Infof("Rebooting to boot activated image %s", image)
+		rebootReq := &syspb.RebootRequest{
+			Method:  syspb.RebootMethod_COLD,
+			Message: fmt.Sprintf("gNOI OS.Activate %s", image),
+		}
+		if _, err := srv.Reboot(ctx, rebootReq); err != nil {
+			log.Errorf("Failed to reboot after activating image %s: %v", image, err)
+			resp.Response = &ospb.ActivateResponse_ActivateError{
+				ActivateError: &ospb.ActivateError{
+					Type:   ospb.ActivateError_UNSPECIFIED,
+					Detail: fmt.Sprintf("Image %s activated but reboot failed: %v", image, err),
+				},
+			}
+			return &resp, nil
+		}
+	}
+
 	resp.Response = &ospb.ActivateResponse_ActivateOk{}
 	return &resp, nil
 }
