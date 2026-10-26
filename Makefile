@@ -136,6 +136,8 @@ go-deps-clean:
 sonic-gnmi: $(GO_DEPS) $(FORMAT_CHECK)
 # advancetls 1.0.0 release need following patch to build by go-1.19
 	patch -d vendor -p0 < patches/0002-Fix-advance-tls-build-with-go-119.patch
+# let the gNMI server disable TLS session tickets
+	patch -d vendor -p0 < patches/0005-advancedtls-option-to-disable-session-tickets.patch
 # build service first which depends on advancetls
 # add support for fsnotify closewrite event
 	patch -d vendor -p0 < patches/0004-CloseWrite-event-support.patch
