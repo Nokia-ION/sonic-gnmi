@@ -1,0 +1,28 @@
+--- ./google.golang.org/grpc/security/advancedtls/advancedtls.go
++++ ./google.golang.org/grpc/security/advancedtls/advancedtls.go
+@@ -218,6 +218,9 @@
+ 	// ciphersuites. TLS 1.3 ciphersuites are not configurable. If nil, a
+ 	// safe default list is used.
+ 	CipherSuites []uint16
++	// SessionTicketsDisabled is only relevant on the server side. If true,
++	// the server does not issue TLS session tickets for session resumption.
++	SessionTicketsDisabled bool
+ 	// serverNameOverride is for testing only and only relevant on the client
+ 	// side. If set to a non-empty string, it will override the virtual host
+ 	// name of authority (e.g. :authority header field) in requests and the
+@@ -344,10 +347,11 @@
+ 		o.MaxTLSVersion = tls.VersionTLS13
+ 	}
+ 	config := &tls.Config{
+-		ClientAuth:   clientAuth,
+-		MinVersion:   o.MinTLSVersion,
+-		MaxVersion:   o.MaxTLSVersion,
+-		CipherSuites: o.CipherSuites,
++		ClientAuth:             clientAuth,
++		MinVersion:             o.MinTLSVersion,
++		MaxVersion:             o.MaxTLSVersion,
++		CipherSuites:           o.CipherSuites,
++		SessionTicketsDisabled: o.SessionTicketsDisabled,
+ 	}
+ 	// Propagate root-certificate-related fields in tls.Config.
+ 	switch {
