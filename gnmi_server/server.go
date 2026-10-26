@@ -547,6 +547,9 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 		},
 		RequireClientCert: false,
 		VerificationType:  advancedtls.SkipVerification,
+		// The FIPS OpenSSL crypto backend has no AES-CTR, which crypto/tls
+		// uses to encrypt session tickets; issuing one panics the server.
+		SessionTicketsDisabled: true,
 	}
 	if cfg.CaCertFile != "" {
 		serverOption.RootOptions = advancedtls.RootCertificateOptions{
