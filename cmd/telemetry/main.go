@@ -88,6 +88,10 @@ type TelemetryConfig struct {
 	IakCertFile              *string
 	IDevIDCertFile           *string
 	IakContextFile           *string
+	IakHandle                *uint
+	IakCertNVIndex           *uint
+	IDevIDCertNVIndex        *uint
+	TPMKeyHandle             *uint
 }
 
 func main() {
@@ -236,6 +240,10 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 		IakCertFile:              fs.String("iak_cert_file", "/keys/iak-chain.crt", "Full path name of the IAK certificate."),
 		IDevIDCertFile:           fs.String("idevid_cert_file", "/keys/idevid-chain.crt", "Full path name of the IDevID certificate."),
 		IakContextFile:           fs.String("iak_context_file", "/run/tpm/iak_context.bin", "Full path name of the saved TPM context of the IAK signing key."),
+		IakHandle:                fs.Uint("iak_handle", 0, "Persistent TPM handle of the IAK signing key (e.g. 0x81821000). Overrides iak_context_file; 0 disables."),
+		IakCertNVIndex:           fs.Uint("iak_cert_nv_index", 0, "TPM NV index of the IAK certificate (e.g. 0x01C91000), read when iak_cert_file does not exist; 0 disables."),
+		IDevIDCertNVIndex:        fs.Uint("idevid_cert_nv_index", 0, "TPM NV index of the IDevID certificate (e.g. 0x01C90000), read when idevid_cert_file does not exist; 0 disables."),
+		TPMKeyHandle:             fs.Uint("tpm_key_handle", 0, "Persistent TPM handle of the IDevID key (e.g. 0x81820000). When set, a server certificate without a key file is served with this key; 0 disables."),
 	}
 
 	fs.Var(&telemetryCfg.UserAuth, "client_auth", "Client auth mode(s) - none,cert,password")
@@ -326,6 +334,10 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 	cfg.IakCertFile = *telemetryCfg.IakCertFile
 	cfg.IDevIDCertFile = *telemetryCfg.IDevIDCertFile
 	cfg.IakContextFile = *telemetryCfg.IakContextFile
+	cfg.IakHandle = uint32(*telemetryCfg.IakHandle)
+	cfg.IakCertNVIndex = uint32(*telemetryCfg.IakCertNVIndex)
+	cfg.IDevIDCertNVIndex = uint32(*telemetryCfg.IDevIDCertNVIndex)
+	cfg.TPMKeyHandle = uint32(*telemetryCfg.TPMKeyHandle)
 	// The owner IAK cert that enrollz installs lives beside the factory IAK
 	// cert, which is the directory the enrollment material is provisioned into.
 	if cfg.IakCertFile != "" {

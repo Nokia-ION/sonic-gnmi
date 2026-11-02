@@ -7,11 +7,20 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
+	"time"
 
 	log "github.com/golang/glog"
 	enrollz_pb "github.com/openconfig/attestz/proto/tpm_enrollz"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+)
+
+const (
+	// oIDevIDCertName is written next to the default profile's links. The
+	// _cert.pem suffix makes a restart keep it as an active rotation.
+	oIDevIDCertName = "oIDevID_cert.pem"
+	oIDevIDVersion  = "oIDevID"
 )
 
 // certFileBackup backs up a cert file to the filesystem before modification,
@@ -101,12 +110,12 @@ func (srv *TpmEnrollzServer) GetIakCert(ctx context.Context, req *enrollz_pb.Get
 	}
 	log.V(1).Infof("Using ControlCardId: %v", controlCardId)
 
-	iakCertBytes, err := os.ReadFile(srv.config.IakCertFile)
+	iakCertBytes, err := readIdentityCert(srv.config, srv.config.IakCertFile, srv.config.IakCertNVIndex)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to read IAK cert from %s: %v", srv.config.IakCertFile, err)
 	}
 
-	idevidCertBytes, err := os.ReadFile(srv.config.IDevIDCertFile)
+	idevidCertBytes, err := readIdentityCert(srv.config, srv.config.IDevIDCertFile, srv.config.IDevIDCertNVIndex)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to read IDevID cert from %s: %v", srv.config.IDevIDCertFile, err)
 	}
@@ -115,6 +124,9 @@ func (srv *TpmEnrollzServer) GetIakCert(ctx context.Context, req *enrollz_pb.Get
 		ControlCardId: controlCardId,
 		IakCert:       string(iakCertBytes),
 		IdevidCert:    string(idevidCertBytes),
+		// RotateOIakCert takes the updates list, not the deprecated
+		// per-card fields that owners send without this flag.
+		AtomicCertRotationSupported: true,
 	}, nil
 }
 
@@ -152,23 +164,36 @@ func (srv *TpmEnrollzServer) RotateOIakCert(ctx context.Context, req *enrollz_pb
 	}
 
 	if hasOidevid {
-		// Installing an oIDevID as the gNxI server certificate only works if the
-		// TLS stack can sign with the TPM-resident IDevID private key, since the
-		// rotation leaves no private key file behind. This build serves TLS from
-		// a cert/key pair on disk, so the oIAK-only rotation is the supported
-		// flow until a TPM signer is wired into SrvAdvConfig.
-		return nil, status.Error(codes.Unimplemented,
-			"oIDevID rotation requires a TPM-backed TLS signer, which this build does not provide; "+
-				"send the update without oidevid_cert and ssl_profile_id to rotate the oIAK cert only")
+		// The rotation leaves no private key file behind, so the listener
+		// must be able to sign with the TPM-resident IDevID key.
+		if !tpmTLSEnabled(srv.config) {
+			return nil, status.Error(codes.Unimplemented,
+				"oIDevID rotation requires a TPM-backed TLS signer, which is not configured (--tpm_key_handle); "+
+					"send the update without oidevid_cert and ssl_profile_id to rotate the oIAK cert only")
+		}
+		if req.GetSslProfileId() != defaultProfile {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"oIDevID can only be installed in the %q SSL profile, got %q", defaultProfile, req.GetSslProfileId())
+		}
 	}
 
-	iakPubKey, err := readPublicKeyFromCertFile(srv.config.IakCertFile)
+	iakPubKey, err := readIdentityPublicKey(srv.config, srv.config.IakCertFile, srv.config.IakCertNVIndex)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to read IAK public key from %s: %v",
 			srv.config.IakCertFile, err)
 	}
 	if err := validateRotatedCertChain(update.GetOiakCert(), iakPubKey, "IAK public key"); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "failed to validate oIAK cert with: %v", err)
+	}
+	if hasOidevid {
+		idevidPubKey, err := readIdentityPublicKey(srv.config, srv.config.IDevIDCertFile, srv.config.IDevIDCertNVIndex)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to read IDevID public key from %s: %v",
+				srv.config.IDevIDCertFile, err)
+		}
+		if err := validateRotatedCertChain(update.GetOidevidCert(), idevidPubKey, "IDevID public key"); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "failed to validate oIDevID cert with: %v", err)
+		}
 	}
 
 	oiakBackup, err := newCertFileBackup(srv.config.OIakCertFile)
@@ -191,14 +216,86 @@ func (srv *TpmEnrollzServer) RotateOIakCert(ctx context.Context, req *enrollz_pb
 		return nil, status.Errorf(codes.Internal, "failed to write oIAK cert to %s: %v",
 			srv.config.OIakCertFile, err)
 	}
+	if hasOidevid {
+		if err := srv.rotateOIDevIDCert(update.GetOidevidCert()); err != nil {
+			return nil, err
+		}
+	}
 
 	committed = true
 	return &enrollz_pb.RotateOIakCertResponse{}, nil
 }
 
-// readPublicKeyFromCertFile reads the first PEM certificate from path and returns its public key.
-func readPublicKeyFromCertFile(path string) (crypto.PublicKey, error) {
-	data, err := os.ReadFile(path)
+// rotateOIDevIDCert installs oidevid as the default profile's server
+// certificate, served with the TPM-resident IDevID key. On failure the
+// previous certificate and links are restored.
+// NOTE: certzMu has to be locked when entering this function.
+func (srv *TpmEnrollzServer) rotateOIDevIDCert(oidevid string) error {
+	cfg := srv.config
+	certPath := filepath.Join(filepath.Dir(cfg.SrvCertLnk), oIDevIDCertName)
+	backup, err := newCertFileBackup(certPath)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to back up oIDevID cert: %v", err)
+	}
+
+	muPath.Lock()
+	defer muPath.Unlock()
+	oldCert, _ := os.Readlink(cfg.SrvCertLnk)
+	oldKey, _ := os.Readlink(cfg.SrvKeyLnk)
+	committed := false
+	defer func() {
+		if committed {
+			backup.cleanup()
+			return
+		}
+		if err := backup.restore(); err != nil {
+			log.Errorf("failed to restore oIDevID cert backup with: %v", err)
+		}
+		for link, target := range map[string]string{cfg.SrvCertLnk: oldCert, cfg.SrvKeyLnk: oldKey} {
+			if err := restoreSymlink(target, link); err != nil {
+				log.Errorf("failed to restore %s with: %v", link, err)
+			}
+		}
+	}()
+
+	if err := attemptWrite(certPath, []byte(oidevid), 0644); err != nil {
+		return status.Errorf(codes.Internal, "failed to write oIDevID cert to %s: %v", certPath, err)
+	}
+	if err := atomicSetSrvCertTPMSigner(cfg, certPath); err != nil {
+		return status.Errorf(codes.Internal, "failed to link oIDevID cert: %v", err)
+	}
+	if _, err := loadServingKeyPair(cfg, cfg.SrvCertLnk, cfg.SrvKeyLnk); err != nil {
+		return status.Errorf(codes.Internal, "oIDevID cert is not servable: %v", err)
+	}
+
+	if srv.gnsiCertz != nil {
+		if p := srv.gnsiCertz.profiles[defaultProfile]; p != nil {
+			if p.ActiveEntities.Cert != nil && p.ActiveEntities.Cert.Final {
+				p.LastEntities.Cert = p.ActiveEntities.Cert
+			}
+			p.ActiveEntities.Cert = &genericEntity{
+				EType:     certType,
+				CreatedOn: uint64(time.Now().Unix()),
+				Version:   oIDevIDVersion,
+				CertPath:  certPath,
+				Final:     true,
+			}
+			writeEntityFreshness(p.ID, p.ActiveEntities.Cert)
+			if cfg.CertzMetaFile != "" {
+				if err := saveCertzMetadata(cfg.CertzMetaFile, srv.gnsiCertz.profiles); err != nil {
+					log.V(1).Infof("failed to save certz metadata after oIDevID rotation: %v", err)
+				}
+			}
+		}
+	}
+	committed = true
+	log.V(1).Infof("Installed oIDevID cert %s in profile %q", certPath, defaultProfile)
+	return nil
+}
+
+// readIdentityPublicKey returns the public key of a factory identity certificate.
+func readIdentityPublicKey(cfg *Config, path string, nvIndex uint32) (crypto.PublicKey, error) {
+	data, err := readIdentityCert(cfg, path, nvIndex)
 	if err != nil {
 		return nil, err
 	}

@@ -305,6 +305,10 @@ func (srv *GNSICertzServer) CanGenerateCSR(ctx context.Context, req *certz.CanGe
 func (srv *GNSICertzServer) bootstrapDefaultProfile() *profile {
 	log.V(2).Info("Bootstrapping default profile")
 	time := uint64(time.Now().UnixNano())
+	keyPath := ""
+	if !tpmTLSEnabled(srv.config) || linkExists(srv.config.SrvKeyLnk) {
+		keyPath = restoreFromFile(srv.config.SrvKeyLnk, srv.config.SrvKeyFile)
+	}
 
 	return &profile{
 		ID: defaultProfile,
@@ -314,7 +318,7 @@ func (srv *GNSICertzServer) bootstrapDefaultProfile() *profile {
 				CreatedOn: time,
 				Version:   "V1",
 				CertPath:  restoreFromFile(srv.config.SrvCertLnk, srv.config.SrvCertFile),
-				KeyPath:   restoreFromFile(srv.config.SrvKeyLnk, srv.config.SrvKeyFile),
+				KeyPath:   keyPath,
 				Final:     true,
 			},
 			TrustBundle: &genericEntity{
@@ -854,7 +858,13 @@ func (srv *GNSICertzServer) revertProfile(profileID string) {
 			rollbackCert = profile.LastEntities.Cert.CertPath
 			rollbackKey = profile.LastEntities.Cert.KeyPath
 		}
-		if err := atomicSetSrvCertKeyPair(srv.config, profileID, rollbackCert, rollbackKey); err != nil {
+		var err error
+		if profileID == defaultProfile && tpmTLSEnabled(srv.config) && rollbackCert != "" && rollbackKey == "" {
+			err = atomicSetSrvCertTPMSigner(srv.config, rollbackCert)
+		} else {
+			err = atomicSetSrvCertKeyPair(srv.config, profileID, rollbackCert, rollbackKey)
+		}
+		if err != nil {
 			log.V(0).Infof("Failed to revert certificate files: %v", err)
 		}
 		if profile.LastEntities.Cert != nil {
@@ -1323,6 +1333,33 @@ func atomicSetSrvCertKeyPair(cfg *Config, profileID, sCert, sKey string) error {
 		return err
 	}
 	log.V(2).Infof("Successful Set Cert: %s for profile %s", sCert, profileID)
+	return nil
+}
+
+// atomicSetSrvCertTPMSigner points the default profile's certificate link at
+// sCert and removes its key link, so the listener signs with the TPM key.
+func atomicSetSrvCertTPMSigner(cfg *Config, sCert string) error {
+	// NOTE: muPath has to be writer-locked when entering this function.
+	log.V(2).Infof("Attempting to set TPM-backed Cert: %s", sCert)
+	cert, err := filepath.Abs(sCert)
+	if err != nil {
+		return err
+	}
+	oldCert, err := rmSymlink(cfg.SrvCertLnk)
+	if err != nil {
+		return err
+	}
+	oldKey, err := rmSymlink(cfg.SrvKeyLnk)
+	if err != nil {
+		_ = restoreSymlink(oldCert, cfg.SrvCertLnk)
+		return err
+	}
+	if err := os.Symlink(cert, cfg.SrvCertLnk); err != nil {
+		_ = restoreSymlink(oldCert, cfg.SrvCertLnk)
+		_ = restoreSymlink(oldKey, cfg.SrvKeyLnk)
+		return err
+	}
+	log.V(2).Infof("Successful Set TPM-backed Cert: %s", sCert)
 	return nil
 }
 

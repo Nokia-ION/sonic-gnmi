@@ -2,7 +2,6 @@ package gnmi
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"os"
@@ -181,7 +180,7 @@ func servingProfilePaths(cfg *Config) profilePaths {
 // all-or-nothing.
 func usableProfile(cfg *Config, id string) (profilePaths, error) {
 	p := getLinkPaths(cfg, id)
-	if _, err := tls.LoadX509KeyPair(p.Cert, p.Key); err != nil {
+	if _, err := loadServingKeyPair(cfg, p.Cert, p.Key); err != nil {
 		return profilePaths{}, err
 	}
 	if cfg.CaCertFile != "" {

@@ -225,6 +225,9 @@ func TestEnrollzGetIakCert_Success(t *testing.T) {
 	if resp.GetIdevidCert() != km.idevidCertPEM {
 		t.Errorf("IdevidCert: got %q, want %q", resp.GetIdevidCert(), km.idevidCertPEM)
 	}
+	if !resp.GetAtomicCertRotationSupported() {
+		t.Error("AtomicCertRotationSupported: got false, want true")
+	}
 	id := resp.GetControlCardId()
 	if id.GetControlCardSerial() != testControlCardSerial {
 		t.Errorf("ControlCardSerial: got %q, want %q", id.GetControlCardSerial(), testControlCardSerial)
@@ -363,9 +366,9 @@ func TestEnrollzRotateOIakCert_SslProfileWithoutOidevid(t *testing.T) {
 	testErr(err, codes.InvalidArgument, "ssl_profile_id must not be provided without oidevid_cert", t)
 }
 
-// TestEnrollzRotateOIakCert_OidevidUnimplemented pins the one deliberate gap in
-// this port: serving an oIDevID as the gNxI server certificate needs a
-// TPM-backed TLS signer that this build does not have.
+// TestEnrollzRotateOIakCert_OidevidUnimplemented: serving an oIDevID as the
+// gNxI server certificate needs the TPM-backed TLS signer, which is off
+// without a TPM key handle.
 func TestEnrollzRotateOIakCert_OidevidUnimplemented(t *testing.T) {
 	km := newTestTpmKeyMaterial(t)
 	cfg := newTestConfig(t)
@@ -385,6 +388,98 @@ func TestEnrollzRotateOIakCert_OidevidUnimplemented(t *testing.T) {
 
 	// The oIAK cert must not have been written either: the request is rejected
 	// as a whole so the caller can retry once support lands.
+	if _, err := os.Stat(cfg.OIakCertFile); !os.IsNotExist(err) {
+		t.Error("oIAK cert should not be written when the request is rejected")
+	}
+}
+
+// newTestTPMServingConfig adds a TPM key handle and a default profile served
+// from the IDevID certificate with no key link, as SrvAdvConfig leaves it.
+func newTestTPMServingConfig(t *testing.T, km *testTpmKeyMaterial) *Config {
+	t.Helper()
+	cfg := newTestConfig(t)
+	dir := filepath.Dir(cfg.IakCertFile)
+	cfg.TPMKeyHandle = 0x81820000
+	cfg.SrvCertLnk = filepath.Join(dir, "server.crt")
+	cfg.SrvKeyLnk = filepath.Join(dir, "server.key")
+	writeKeyMaterial(t, cfg.IakCertFile, cfg.IDevIDCertFile, km)
+	if err := os.Symlink(cfg.IDevIDCertFile, cfg.SrvCertLnk); err != nil {
+		t.Fatalf("setup: link server cert: %v", err)
+	}
+	return cfg
+}
+
+func TestEnrollzRotateOIakCert_OidevidInstallsTPMBackedCert(t *testing.T) {
+	km := newTestTpmKeyMaterial(t)
+	cfg := newTestTPMServingConfig(t, km)
+	srv := newTestEnrollzServer(t, cfg)
+
+	req := &enrollz_pb.RotateOIakCertRequest{
+		SslProfileId: defaultProfile,
+		Updates: []*enrollz_pb.ControlCardCertUpdate{{
+			ControlCardSelection: testCardSelection(),
+			OiakCert:             km.oiakCertPEM,
+			OidevidCert:          km.oidevidCertPEM,
+		}},
+	}
+	if _, err := srv.RotateOIakCert(context.Background(), req); err != nil {
+		t.Fatalf("RotateOIakCert returned unexpected error: %v", err)
+	}
+
+	certPath := filepath.Join(filepath.Dir(cfg.SrvCertLnk), oIDevIDCertName)
+	if got, err := os.ReadFile(certPath); err != nil || string(got) != km.oidevidCertPEM {
+		t.Errorf("oIDevID cert: got %q, %v; want the rotated cert", got, err)
+	}
+	if target, err := os.Readlink(cfg.SrvCertLnk); err != nil || target != certPath {
+		t.Errorf("server cert link: got %q, %v; want %q", target, err, certPath)
+	}
+	if linkExists(cfg.SrvKeyLnk) {
+		t.Error("server key link should not exist for a TPM-backed certificate")
+	}
+	if got, err := os.ReadFile(cfg.OIakCertFile); err != nil || string(got) != km.oiakCertPEM {
+		t.Errorf("oIAK cert: got %q, %v; want the rotated cert", got, err)
+	}
+}
+
+func TestEnrollzRotateOIakCert_OidevidWrongProfile(t *testing.T) {
+	km := newTestTpmKeyMaterial(t)
+	cfg := newTestTPMServingConfig(t, km)
+	srv := newTestEnrollzServer(t, cfg)
+
+	req := &enrollz_pb.RotateOIakCertRequest{
+		SslProfileId: "some-profile",
+		Updates: []*enrollz_pb.ControlCardCertUpdate{{
+			ControlCardSelection: testCardSelection(),
+			OiakCert:             km.oiakCertPEM,
+			OidevidCert:          km.oidevidCertPEM,
+		}},
+	}
+	_, err := srv.RotateOIakCert(context.Background(), req)
+	testErr(err, codes.InvalidArgument, "oIDevID can only be installed in the", t)
+}
+
+func TestEnrollzRotateOIakCert_OidevidKeyMismatch(t *testing.T) {
+	km := newTestTpmKeyMaterial(t)
+	cfg := newTestTPMServingConfig(t, km)
+	srv := newTestEnrollzServer(t, cfg)
+
+	wrongKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate wrong key: %v", err)
+	}
+	req := &enrollz_pb.RotateOIakCertRequest{
+		SslProfileId: defaultProfile,
+		Updates: []*enrollz_pb.ControlCardCertUpdate{{
+			ControlCardSelection: testCardSelection(),
+			OiakCert:             km.oiakCertPEM,
+			OidevidCert:          selfSignedCertPEM(t, wrongKey),
+		}},
+	}
+	_, err = srv.RotateOIakCert(context.Background(), req)
+	testErr(err, codes.InvalidArgument, "leaf cert public key does not match IDevID public key", t)
+	if target, _ := os.Readlink(cfg.SrvCertLnk); target != cfg.IDevIDCertFile {
+		t.Errorf("server cert link changed on a rejected request: %q", target)
+	}
 	if _, err := os.Stat(cfg.OIakCertFile); !os.IsNotExist(err) {
 		t.Error("oIAK cert should not be written when the request is rejected")
 	}
