@@ -325,6 +325,14 @@ type Config struct {
 	IDevIDCertFile string // Path to the device's factory IDevID certificate chain.
 	OIakCertFile   string // Path to the owner IAK certificate, derived from IakCertFile.
 	IakContextFile string // Path to the saved TPM context of the IAK signing key.
+	IakHandle      uint32 // Persistent TPM handle of the IAK; takes precedence over IakContextFile.
+	// TPM NV indexes holding the factory IAK and IDevID certificates, read
+	// when IakCertFile or IDevIDCertFile does not exist. 0 disables.
+	IakCertNVIndex    uint32
+	IDevIDCertNVIndex uint32
+	// Persistent TPM handle of the IDevID key. When set, a profile without a
+	// key file presents its certificate with this key (IDevID or oIDevID).
+	TPMKeyHandle uint32
 }
 
 // DBusOSBackend is a concrete implementation of OSBackend
@@ -504,7 +512,29 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 	// the configured server cert/key on start unless a Certz rotation is in
 	// effect for both links. Certz rotates the pair together, so we treat them
 	// as a unit.
-	if !symlinkPointsToRotation(cfg.SrvCertLnk) || !symlinkPointsToRotation(cfg.SrvKeyLnk) {
+	// The enrollz oIDevID is served with the TPM key and has no key link.
+	certTarget, _ := os.Readlink(cfg.SrvCertLnk)
+	tpmRotation := tpmTLSEnabled(cfg) && symlinkPointsToRotation(cfg.SrvCertLnk) &&
+		filepath.Base(certTarget) == oIDevIDCertName
+	_, keyErr := os.Stat(cfg.SrvKeyFile)
+	switch {
+	case tpmRotation:
+		if _, err := rmSymlink(cfg.SrvKeyLnk); err != nil {
+			return nil, nil, fmt.Errorf("remove stale server key link: %v", err)
+		}
+		log.V(1).Infof("Serving TPM-backed %s with TPM key 0x%08X", certTarget, cfg.TPMKeyHandle)
+	case !symlinkPointsToRotation(cfg.SrvCertLnk) && tpmTLSEnabled(cfg) && cfg.SrvCertFile != "" &&
+		(cfg.SrvKeyFile == "" || errors.Is(keyErr, os.ErrNotExist)):
+		// No key file: the configured certificate is the IDevID, whose key
+		// is in the TPM.
+		if _, err := os.Stat(cfg.SrvCertFile); err != nil {
+			return nil, nil, fmt.Errorf("server certificate file stat error: %v", err)
+		}
+		if err := atomicSetSrvCertTPMSigner(cfg, cfg.SrvCertFile); err != nil {
+			return nil, nil, err
+		}
+		log.V(1).Infof("Serving %s with TPM key 0x%08X", cfg.SrvCertFile, cfg.TPMKeyHandle)
+	case !symlinkPointsToRotation(cfg.SrvCertLnk) || !symlinkPointsToRotation(cfg.SrvKeyLnk):
 		if cfg.SrvCertFile == "" || cfg.SrvKeyFile == "" {
 			// No configured material to (re)link. Fall back to any existing
 			// valid symlinks; only fail if there is nothing usable to serve.
@@ -532,7 +562,7 @@ func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, er
 			defer muPath.RUnlock()
 
 			paths := servingProfilePaths(cfg)
-			cert, err := tls.LoadX509KeyPair(paths.Cert, paths.Key)
+			cert, err := loadServingKeyPair(cfg, paths.Cert, paths.Key)
 			if err != nil {
 				return nil, fmt.Errorf("could not load server key pair: %s", err)
 			}
