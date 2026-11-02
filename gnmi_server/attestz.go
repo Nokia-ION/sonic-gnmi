@@ -83,19 +83,22 @@ func (srv *TpmAttestzServer) Attest(ctx context.Context, req *attestz_pb.AttestR
 	}
 	defer tpmDev.Close()
 
-	iakContextFile := cfg.IakContextFile
-	if iakContextFile == "" {
-		iakContextFile = defaultIakContextPath
-	}
-	iakHandle, err := loadTPMContext(tpmDev, iakContextFile)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "load IAK context: %v", err)
-	}
-	defer func() {
-		if _, err := (tpm2.FlushContext{FlushHandle: iakHandle}).Execute(tpmDev); err != nil {
-			log.Errorf("failed to flush IAK TPM context: %v", err)
+	iakHandle := tpm2.TPMIDHContext(cfg.IakHandle)
+	if iakHandle == 0 {
+		iakContextFile := cfg.IakContextFile
+		if iakContextFile == "" {
+			iakContextFile = defaultIakContextPath
 		}
-	}()
+		iakHandle, err = loadTPMContext(tpmDev, iakContextFile)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "load IAK context: %v", err)
+		}
+		defer func() {
+			if _, err := (tpm2.FlushContext{FlushHandle: iakHandle}).Execute(tpmDev); err != nil {
+				log.Errorf("failed to flush IAK TPM context: %v", err)
+			}
+		}()
+	}
 
 	pcrValues, err := readSelectPCRValues(tpmDev, hashAlg, req.GetPcrIndices())
 	if err != nil {
