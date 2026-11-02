@@ -40,6 +40,11 @@ func loadServingKeyPair(cfg *Config, certPath, keyPath string) (tls.Certificate,
 	return tls.LoadX509KeyPair(certPath, keyPath)
 }
 
+// LoadServingKeyPair is loadServingKeyPair for the telemetry cert watcher.
+func LoadServingKeyPair(cfg *Config, certPath, keyPath string) (tls.Certificate, error) {
+	return loadServingKeyPair(cfg, certPath, keyPath)
+}
+
 // linkExists reports whether path exists, without following a symlink.
 func linkExists(path string) bool {
 	_, err := os.Lstat(path)

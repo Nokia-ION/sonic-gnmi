@@ -754,7 +754,7 @@ func (srv *GNSICertzServer) saveEntities(profileID string, entityMsg *certz.Enti
 		if tb.Encoding != certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM {
 			return status.Errorf(codes.InvalidArgument, "trustBundle encoding has to be PEM")
 		}
-		bundle := tb.Certificate
+		bundle := certPEM(tb)
 		if len(bundle) == 0 {
 			return status.Errorf(codes.InvalidArgument, "trustBundle cannot be empty")
 		}
@@ -809,12 +809,12 @@ func (srv *GNSICertzServer) readCertChain(profileID string, certChain *certz.Cer
 	if certChain.GetCertificate().Encoding != certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "certificate encoding has to be PEM")
 	}
-	if certChain.GetCertificate().Certificate == nil {
+	if len(certPEM(certChain.GetCertificate())) == 0 {
 		return nil, nil, status.Errorf(codes.InvalidArgument, "Missing Cert data")
 	}
-	cert := append(certChain.GetCertificate().Certificate, byte('\n'))
-	key := certChain.GetCertificate().PrivateKey
-	if certChain.GetCertificate().PrivateKey == nil {
+	cert := append(certPEM(certChain.GetCertificate()), byte('\n'))
+	key := keyPEM(certChain.GetCertificate())
+	if len(key) == 0 {
 		if srv.profiles[profileID].generatedKey == nil {
 			return nil, nil, status.Errorf(codes.InvalidArgument, "Missing Key")
 		}
@@ -831,11 +831,28 @@ func (srv *GNSICertzServer) readCertChain(profileID string, certChain *certz.Cer
 			return nil, nil, status.Errorf(codes.InvalidArgument, "certificate encoding has to be PEM")
 		}
 		//replace with slices.Concat once go1.22 is available
-		cert = append(cert, append(certChain.GetCertificate().Certificate, byte('\n'))...)
+		cert = append(cert, append(certPEM(certChain.GetCertificate()), byte('\n'))...)
 
 		certChain = certChain.GetParent()
 	}
 	return cert, key, nil
+}
+
+// certPEM returns raw_certificate, or the deprecated certificate field that
+// older clients still send.
+func certPEM(c *certz.Certificate) []byte {
+	if raw := c.GetRawCertificate(); len(raw) > 0 {
+		return raw
+	}
+	return c.GetCertificate()
+}
+
+// keyPEM returns raw_private_key, or the deprecated private_key field.
+func keyPEM(c *certz.Certificate) []byte {
+	if raw := c.GetRawPrivateKey(); len(raw) > 0 {
+		return raw
+	}
+	return c.GetPrivateKey()
 }
 
 func (srv *GNSICertzServer) revertProfile(profileID string) {
