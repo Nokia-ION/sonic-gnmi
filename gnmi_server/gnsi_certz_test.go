@@ -1730,6 +1730,48 @@ var gnsiCertzTestCases = []struct {
 	},
 }
 
+func TestReadCertChainRawFields(t *testing.T) {
+	cs := &GNSICertzServer{profiles: map[string]*profile{defaultProfile: {ID: defaultProfile}}}
+	pemCert := func(c *certz.Certificate) *certz.Certificate {
+		c.Type = certz.CertificateType_CERTIFICATE_TYPE_X509
+		c.Encoding = certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM
+		return c
+	}
+	chain := &certz.CertificateChain{
+		Certificate: pemCert(&certz.Certificate{
+			CertificateType: &certz.Certificate_RawCertificate{RawCertificate: []byte("leaf")},
+			PrivateKeyType:  &certz.Certificate_RawPrivateKey{RawPrivateKey: []byte("raw-key")},
+		}),
+		Parent: &certz.CertificateChain{
+			Certificate: pemCert(&certz.Certificate{Certificate: []byte("parent")}),
+		},
+	}
+	cert, key, err := cs.readCertChain(defaultProfile, chain)
+	if err != nil {
+		t.Fatalf("readCertChain: %v", err)
+	}
+	if string(cert) != "leaf\nparent\n" || string(key) != "raw-key" {
+		t.Fatalf("got cert %q key %q", cert, key)
+	}
+
+	legacy := pemCert(&certz.Certificate{Certificate: []byte("old"), PrivateKey: []byte("old-key")})
+	if string(certPEM(legacy)) != "old" || string(keyPEM(legacy)) != "old-key" {
+		t.Fatalf("deprecated fields not read: %q %q", certPEM(legacy), keyPEM(legacy))
+	}
+	if certPEM(pemCert(&certz.Certificate{})) != nil {
+		t.Fatal("empty certificate should have no PEM")
+	}
+	emptyRaw := pemCert(&certz.Certificate{
+		Certificate:     []byte("old"),
+		CertificateType: &certz.Certificate_RawCertificate{RawCertificate: []byte{}},
+		PrivateKey:      []byte("old-key"),
+		PrivateKeyType:  &certz.Certificate_RawPrivateKey{RawPrivateKey: []byte{}},
+	})
+	if string(certPEM(emptyRaw)) != "old" || string(keyPEM(emptyRaw)) != "old-key" {
+		t.Fatalf("empty raw fields should fall back: %q %q", certPEM(emptyRaw), keyPEM(emptyRaw))
+	}
+}
+
 func TestGetLinkPathsIsolatesCustomProfiles(t *testing.T) {
 	cfg := &Config{
 		SrvCertLnk:    "/keys/server_cert.lnk",
