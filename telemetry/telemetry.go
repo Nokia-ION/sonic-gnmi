@@ -459,8 +459,10 @@ func iNotifyCertMonitoring(watcher *fsnotify.Watcher, telemetryCfg *TelemetryCon
 					if event.Op&(fsnotify.CloseWrite|fsnotify.MovedTo|fsnotify.Create) != 0 {
 						log.V(1).Infof("Cert File has been modified: %s", event.Name)
 
-						// Validate cert/key pair before signaling reload
-						_, err := tls.LoadX509KeyPair(*telemetryCfg.ServerCert, *telemetryCfg.ServerKey)
+						// Validate cert/key pair before signaling reload. With
+						// TPM TLS, a cert without a key file uses the TPM key.
+						tpmCfg := &gnmi.Config{TPMPath: *telemetryCfg.TPMDevice, TPMKeyHandle: uint32(*telemetryCfg.TPMKeyHandle)}
+						_, err := gnmi.LoadServingKeyPair(tpmCfg, *telemetryCfg.ServerCert, *telemetryCfg.ServerKey)
 						if err != nil {
 							log.V(1).Infof("Cert validation failed: %v", err)
 							continue // Keep monitoring - wait for matching cert/key pair
