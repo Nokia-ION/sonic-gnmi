@@ -700,8 +700,23 @@ func TestGnsiAuthzRotateUnauthenticated(t *testing.T) {
 
 }
 
-// TestGnsiAuthzUnimplemented tests implementation of gnsi.authz Probe and Get server.
-func TestGnsiAuthzUnimplemented(t *testing.T) {
+// TestGnsiAuthzProbeAndGet tests the gnsi.authz Probe and Get server.
+func TestGnsiAuthzProbeAndGet(t *testing.T) {
+	dir := t.TempDir()
+	policyFile, metaFile := TestAuthzPolicyFile, TestAuthzMetaFile
+	TestAuthzPolicyFile = filepath.Join(dir, "authz_policy.json")
+	TestAuthzMetaFile = filepath.Join(dir, "authz_meta.json")
+	defer func() { TestAuthzPolicyFile, TestAuthzMetaFile = policyFile, metaFile }()
+	if err := os.WriteFile(TestAuthzPolicyFile, []byte(authzTestPolicyFileV2), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	orig := authenticateFunc
+	defer func() { authenticateFunc = orig }()
+	authenticateFunc = func(config *Config, ctx context.Context, target string, writeAccess bool) (context.Context, error) {
+		return ctx, nil
+	}
+
 	const testPort = 8082 // Use a different port to avoid conflict
 	s := createAuthServer(t, testPort)
 	go runServer(t, s)
@@ -734,10 +749,33 @@ func TestGnsiAuthzUnimplemented(t *testing.T) {
 	})
 
 	// --- Test Get RPC ---
-	t.Run("GetUnimplemented", func(t *testing.T) {
-		_, err := sc.Get(ctx, &authz.GetRequest{})
-		if status.Code(err) != codes.Unimplemented {
-			t.Fatalf("Get() returned unexpected error code: got %v, want %v", status.Code(err), codes.Unimplemented)
+	t.Run("GetActivePolicy", func(t *testing.T) {
+		want, err := os.ReadFile(s.config.AuthzPolicyFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := sc.Get(ctx, &authz.GetRequest{})
+		if err != nil {
+			t.Fatalf("Get() failed: %v", err)
+		}
+		if resp.GetPolicy() != string(want) {
+			t.Errorf("Get() policy = %q, want %q", resp.GetPolicy(), want)
+		}
+		if resp.GetVersion() != s.gnsiAuthz.authzMetadata.AuthzVersion {
+			t.Errorf("Get() version = %q, want %q", resp.GetVersion(), s.gnsiAuthz.authzMetadata.AuthzVersion)
+		}
+	})
+
+	t.Run("GetNoPolicy", func(t *testing.T) {
+		policyFile := s.config.AuthzPolicyFile
+		s.config.AuthzPolicyFile = filepath.Join(t.TempDir(), "missing.json")
+		defer func() { s.config.AuthzPolicyFile = policyFile }()
+		resp, err := sc.Get(ctx, &authz.GetRequest{})
+		if err != nil {
+			t.Fatalf("Get() without a policy failed: %v", err)
+		}
+		if resp.GetPolicy() != "" {
+			t.Errorf("Get() without a policy returned policy %q", resp.GetPolicy())
 		}
 	})
 }

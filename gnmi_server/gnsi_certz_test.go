@@ -3,6 +3,8 @@ package gnmi
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"os"
@@ -1958,5 +1960,35 @@ func isLinkCorrect(t *testing.T, lnk, kind, id, ver string) {
 	err := fmt.Errorf("link '%s' does not point to '%s_%s_*_%s.pem'. It points to '%s'", lnk, id, ver, kind, f.Name())
 	if !p.MatchString(f.Name()) {
 		t.Fatal(err)
+	}
+}
+
+// TestGenerateCsrSubject checks that the CSR subject only has the fields the
+// request sets.
+func TestGenerateCsrSubject(t *testing.T) {
+	srv := &GNSICertzServer{profiles: map[string]*profile{"gnxi": {ID: "gnxi"}}}
+	resp, err := srv.doGenerateCsr("gnxi", &certz.GenerateCSRRequest{
+		Params: &certz.CSRParams{
+			CsrSuite:     certz.CSRSuite_CSRSUITE_X509_KEY_TYPE_ECDSA_PRIME256V1_SIGNATURE_ALGORITHM_SHA_2_256,
+			CommonName:   "switch.example.com",
+			Organization: "Example",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode(resp.GetCertificateSigningRequest().GetCertificateSigningRequest())
+	if block == nil {
+		t.Fatal("CSR is not PEM")
+	}
+	csr, err := x509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := csr.Subject.String(), "CN=switch.example.com,O=Example"; got != want {
+		t.Errorf("CSR subject = %q, want %q", got, want)
+	}
+	if srv.profiles["gnxi"].generatedKey == nil {
+		t.Error("generated key was not kept")
 	}
 }
