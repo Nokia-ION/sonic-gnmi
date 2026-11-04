@@ -19,6 +19,8 @@ import (
 
 var (
 	authzMu sync.Mutex
+	// authzPolicyMu guards the policy file and its version while they change.
+	authzPolicyMu sync.RWMutex
 )
 
 var (
@@ -43,8 +45,28 @@ type GNSIAuthzServer struct {
 func (srv *GNSIAuthzServer) Probe(context.Context, *authz.ProbeRequest) (*authz.ProbeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method Probe not implemented")
 }
-func (srv *GNSIAuthzServer) Get(context.Context, *authz.GetRequest) (*authz.GetResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Get not implemented")
+
+// Get implements the gNSI.authz.Get RPC. It returns the active policy with its
+// version and creation time; until a policy is installed with Rotate, the
+// policy is empty.
+func (srv *GNSIAuthzServer) Get(ctx context.Context, req *authz.GetRequest) (*authz.GetResponse, error) {
+	log.V(2).Infof("GNSI Authz Get RPC")
+	if _, err := authenticateFunc(srv.config, ctx, "gnoi", false); err != nil {
+		log.Errorf("authentication failed in Get RPC: %v", err)
+		return nil, err
+	}
+	authzPolicyMu.RLock()
+	defer authzPolicyMu.RUnlock()
+	policy, err := os.ReadFile(srv.config.AuthzPolicyFile)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, status.Errorf(codes.Internal, "failed to read authz policy %s: %v", srv.config.AuthzPolicyFile, err)
+	}
+	createdOn, _ := strconv.ParseUint(srv.authzMetadata.AuthzCreatedOn, 10, 64)
+	return &authz.GetResponse{
+		Version:   srv.authzMetadata.AuthzVersion,
+		CreatedOn: createdOn,
+		Policy:    string(policy),
+	}, nil
 }
 func NewGNSIAuthzServer(srv *Server) *GNSIAuthzServer {
 	ret := &GNSIAuthzServer{
@@ -91,19 +113,13 @@ func (srv *GNSIAuthzServer) Rotate(stream authz.Authz_RotateServer) error {
 		if err == io.EOF {
 			log.V(0).Infof("[%v]gNSI: Received unexpected EOF", session)
 			// Connection closed without Finalize message. Revert all changes made until now.
-			if err := copyFile(srv.config.AuthzPolicyFile+backupExt, srv.config.AuthzPolicyFile); err != nil {
-				log.V(0).Infof("[%v]gnsi: failed to revert authz policy file (%v): %v", session, srv.config.AuthzPolicyFile, err)
-			}
-			srv.revertAuthzFileFreshness()
+			srv.revertAuthzPolicy(session)
 			return status.Errorf(codes.Aborted, "No Finalize message")
 		}
 		if err != nil {
 			log.V(0).Infof("[%v]gnsi: while processing a rotate request got error: `%v`. Reverting to last good state.", session, err)
 			// Connection closed without Finalize message. Revert all changes made until now.
-			if err := copyFile(srv.config.AuthzPolicyFile+backupExt, srv.config.AuthzPolicyFile); err != nil {
-				log.V(0).Infof("[%v]gnsi: failed to revert authz policy file (%v): %v", session, srv.config.AuthzPolicyFile, err)
-			}
-			srv.revertAuthzFileFreshness()
+			srv.revertAuthzPolicy(session)
 			return status.Errorf(codes.Aborted, "%s", err.Error())
 		}
 		if endReq := req.GetFinalizeRotation(); endReq != nil {
@@ -117,22 +133,27 @@ func (srv *GNSIAuthzServer) Rotate(stream authz.Authz_RotateServer) error {
 		if err != nil {
 			log.V(0).Infof("[%v]gnsi: while processing a rotate request got error: `%v`. Reverting to last good state.", session, err)
 			// Connection closed without Finalize message. Revert all changes made until now.
-			if err := copyFile(srv.config.AuthzPolicyFile+backupExt, srv.config.AuthzPolicyFile); err != nil {
-				log.V(0).Infof("[%v]gnsi: failed to revert authz policy file (%v): %v", session, srv.config.AuthzPolicyFile, err)
-			}
-			srv.revertAuthzFileFreshness()
+			srv.revertAuthzPolicy(session)
 			return err
 		}
 		if err := stream.Send(resp); err != nil {
 			log.V(0).Infof("[%v]gnsi: while processing a rotate request got error: `%v`. Reverting to last good state.", session, err)
 			// Connection closed without Finalize message. Revert all changes made until now.
-			if err := copyFile(srv.config.AuthzPolicyFile+backupExt, srv.config.AuthzPolicyFile); err != nil {
-				log.V(0).Infof("[%v]gnsi: failed to revert authz policy file (%v): %v", session, srv.config.AuthzPolicyFile, err)
-			}
-			srv.revertAuthzFileFreshness()
+			srv.revertAuthzPolicy(session)
 			return status.Errorf(codes.Aborted, "%s", err.Error())
 		}
 	}
+}
+
+// revertAuthzPolicy restores the policy file and its version from before the
+// Rotate stream.
+func (srv *GNSIAuthzServer) revertAuthzPolicy(session int) {
+	authzPolicyMu.Lock()
+	defer authzPolicyMu.Unlock()
+	if err := copyFile(srv.config.AuthzPolicyFile+backupExt, srv.config.AuthzPolicyFile); err != nil {
+		log.V(0).Infof("[%v]gnsi: failed to revert authz policy file (%v): %v", session, srv.config.AuthzPolicyFile, err)
+	}
+	srv.revertAuthzFileFreshness()
 }
 
 func (srv *GNSIAuthzServer) processRotateRequest(req *authz.RotateAuthzRequest) (*authz.RotateAuthzResponse, error) {
@@ -157,13 +178,19 @@ func (srv *GNSIAuthzServer) processRotateRequest(req *authz.RotateAuthzRequest) 
 	if srv.gnsiAuthz.authzMetadata.AuthzVersion == policyReq.GetVersion() && !req.GetForceOverwrite() {
 		return nil, status.Errorf(codes.AlreadyExists, "Authz with version `%v` already exists", policyReq.GetVersion())
 	}
+	authzPolicyMu.Lock()
+	defer authzPolicyMu.Unlock()
+	prev := *srv.authzMetadata
 	if err := srv.writeAuthzMetadataToDB(authzVersionFld, policyReq.GetVersion()); err != nil {
+		srv.restoreAuthzMetadata(prev)
 		return nil, status.Errorf(codes.Aborted, "%s", err.Error())
 	}
 	if err := srv.writeAuthzMetadataToDB(authzCreatedOnFld, strconv.FormatUint(policyReq.GetCreatedOn(), 10)); err != nil {
+		srv.restoreAuthzMetadata(prev)
 		return nil, status.Errorf(codes.Aborted, "%s", err.Error())
 	}
 	if err := srv.saveToAuthzFile(policyReq.GetPolicy()); err != nil {
+		srv.restoreAuthzMetadata(prev)
 		return nil, status.Errorf(codes.Aborted, "%s", err.Error())
 	}
 	resp := &authz.RotateAuthzResponse{
@@ -257,6 +284,15 @@ func NewAuthzMetadata() *AuthzMetadata {
 func (srv *GNSIAuthzServer) checkpointAuthzFreshness() {
 	log.V(2).Infof("checkpoint authz freshness")
 	srv.authzMetadataCopy = *srv.authzMetadata
+}
+
+// restoreAuthzMetadata puts back the version and creation time of the policy
+// that is still in the policy file, after a failed upload. The caller holds
+// authzPolicyMu.
+func (srv *GNSIAuthzServer) restoreAuthzMetadata(m AuthzMetadata) {
+	srv.writeAuthzMetadataToDB(authzVersionFld, m.AuthzVersion)
+	srv.writeAuthzMetadataToDB(authzCreatedOnFld, m.AuthzCreatedOn)
+	*srv.authzMetadata = m
 }
 
 func (srv *GNSIAuthzServer) revertAuthzFileFreshness() {

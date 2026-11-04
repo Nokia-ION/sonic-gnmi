@@ -539,14 +539,16 @@ func (srv *GNSICertzServer) doGenerateCsr(profileID string, req *certz.GenerateC
 	log.V(2).Info("Generating Csr")
 
 	keySize, sigAlgo := parseCSRSuite(req.GetParams().GetCsrSuite())
+	// Fields the request leaves empty are omitted: an empty attribute, such
+	// as a Country that is not two letters, is invalid X.509 and CAs reject it.
 	csrTemplate := x509.CertificateRequest{
 		Subject: pkix.Name{
 			CommonName:         req.GetParams().CommonName,
-			Country:            []string{req.GetParams().Country},
-			Province:           []string{req.GetParams().State},
-			Locality:           []string{req.GetParams().City},
-			Organization:       []string{req.GetParams().Organization},
-			OrganizationalUnit: []string{req.GetParams().OrganizationalUnit},
+			Country:            nonEmpty(req.GetParams().Country),
+			Province:           nonEmpty(req.GetParams().State),
+			Locality:           nonEmpty(req.GetParams().City),
+			Organization:       nonEmpty(req.GetParams().Organization),
+			OrganizationalUnit: nonEmpty(req.GetParams().OrganizationalUnit),
 		},
 		SignatureAlgorithm: sigAlgo,
 	}
@@ -604,6 +606,14 @@ func (srv *GNSICertzServer) doGenerateCsr(profileID string, req *certz.GenerateC
 			CertificateSigningRequest: csr,
 		},
 	}, nil
+}
+
+// nonEmpty returns s as a one-element slice, or nil if s is empty.
+func nonEmpty(s string) []string {
+	if s == "" {
+		return nil
+	}
+	return []string{s}
 }
 
 func (srv *GNSICertzServer) doUpload(req *certz.UploadRequest, overwrite bool, profileID string) (*certz.UploadResponse, error) {
