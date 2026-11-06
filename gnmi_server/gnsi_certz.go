@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -845,7 +846,34 @@ func (srv *GNSICertzServer) readCertChain(profileID string, certChain *certz.Cer
 
 		certChain = certChain.GetParent()
 	}
+	if err := verifyCertChain(cert, key); err != nil {
+		return nil, nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	return cert, key, nil
+}
+
+// verifyCertChain checks that key is the private key of the leaf in chain,
+// and that each certificate in chain is signed by the one after it. An upload
+// is served as soon as it is activated, so a bad chain or key would break
+// every new TLS connection.
+func verifyCertChain(chain, key []byte) error {
+	pair, err := tls.X509KeyPair(chain, key)
+	if err != nil {
+		return fmt.Errorf("invalid certificate or private key: %w", err)
+	}
+	certs := make([]*x509.Certificate, len(pair.Certificate))
+	for i, der := range pair.Certificate {
+		if certs[i], err = x509.ParseCertificate(der); err != nil {
+			return fmt.Errorf("parse certificate %d of the chain: %w", i, err)
+		}
+	}
+	for i := 0; i+1 < len(certs); i++ {
+		if err := certs[i].CheckSignatureFrom(certs[i+1]); err != nil {
+			return fmt.Errorf("certificate %q is not signed by its parent %q: %w",
+				certs[i].Subject, certs[i+1].Subject, err)
+		}
+	}
+	return nil
 }
 
 // certPEM returns raw_certificate, or the deprecated certificate field that
