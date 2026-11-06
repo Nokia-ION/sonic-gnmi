@@ -2,11 +2,16 @@ package gnmi
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -78,14 +83,7 @@ var gnsiCertzTestCases = []struct {
 
 			// 1) Generate a Certificate and send it to the switch.
 			ver := generateVersion()
-			certPem, err := os.ReadFile(GoldSCertV2)
-			if err != nil {
-				t.Fatal(err)
-			}
-			keyPem, err := os.ReadFile(GoldSKeyV2)
-			if err != nil {
-				t.Fatal(err)
-			}
+			certPem, keyPem := newTestLeaf(t)
 			err = stream.Send(&certz.RotateCertificateRequest{
 				RotateRequest: &certz.RotateCertificateRequest_Certificates{
 					Certificates: &certz.UploadRequest{
@@ -844,14 +842,7 @@ var gnsiCertzTestCases = []struct {
 			}
 
 			ver := generateVersion()
-			certPem, err := os.ReadFile(GoldSCertV2)
-			if err != nil {
-				t.Fatal(err)
-			}
-			keyPem, err := os.ReadFile(GoldSKeyV2)
-			if err != nil {
-				t.Fatal(err)
-			}
+			certPem, keyPem := newTestLeaf(t)
 			err = stream.Send(&certz.RotateCertificateRequest{
 				RotateRequest: &certz.RotateCertificateRequest_Certificates{
 					Certificates: &certz.UploadRequest{
@@ -1665,7 +1656,8 @@ var gnsiCertzTestCases = []struct {
 			profileID := "gnxi"
 
 			// 1. Setup profile with a generated key to cover the "Using generated key" branch
-			fakeGeneratedKey := []byte("fake-generated-private-key")
+			ca := newTestCA(t, "ca")
+			leafPem, fakeGeneratedKey := ca.issue(t, "leaf")
 			certzMu.Lock()
 			if _, ok := cs.profiles[profileID]; !ok {
 				cs.profiles[profileID] = &profile{ID: profileID}
@@ -1679,14 +1671,14 @@ var gnsiCertzTestCases = []struct {
 				Certificate: &certz.Certificate{
 					Type:        certz.CertificateType_CERTIFICATE_TYPE_X509,
 					Encoding:    certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM,
-					Certificate: []byte("child-cert-data"),
+					Certificate: leafPem,
 					PrivateKey:  nil, // This triggers the generatedKey logic
 				},
 				Parent: &certz.CertificateChain{
 					Certificate: &certz.Certificate{
 						Type:        certz.CertificateType_CERTIFICATE_TYPE_X509,
 						Encoding:    certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM,
-						Certificate: []byte("parent-cert-data"),
+						Certificate: ca.certPEM,
 					},
 				},
 			}
@@ -1703,7 +1695,7 @@ var gnsiCertzTestCases = []struct {
 
 			// Verify Cert Chain Concatenation (Child + Parent)
 			// The code appends a newline after each cert
-			expectedCert := "child-cert-data\nparent-cert-data\n"
+			expectedCert := string(leafPem) + "\n" + string(ca.certPEM) + "\n"
 			if string(cert) != expectedCert {
 				t.Errorf("Cert chain concatenation failed. Expected %q, got %q", expectedCert, string(cert))
 			}
@@ -1739,20 +1731,22 @@ func TestReadCertChainRawFields(t *testing.T) {
 		c.Encoding = certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM
 		return c
 	}
+	ca := newTestCA(t, "ca")
+	leaf, leafKey := ca.issue(t, "leaf")
 	chain := &certz.CertificateChain{
 		Certificate: pemCert(&certz.Certificate{
-			CertificateType: &certz.Certificate_RawCertificate{RawCertificate: []byte("leaf")},
-			PrivateKeyType:  &certz.Certificate_RawPrivateKey{RawPrivateKey: []byte("raw-key")},
+			CertificateType: &certz.Certificate_RawCertificate{RawCertificate: leaf},
+			PrivateKeyType:  &certz.Certificate_RawPrivateKey{RawPrivateKey: leafKey},
 		}),
 		Parent: &certz.CertificateChain{
-			Certificate: pemCert(&certz.Certificate{Certificate: []byte("parent")}),
+			Certificate: pemCert(&certz.Certificate{Certificate: ca.certPEM}),
 		},
 	}
 	cert, key, err := cs.readCertChain(defaultProfile, chain)
 	if err != nil {
 		t.Fatalf("readCertChain: %v", err)
 	}
-	if string(cert) != "leaf\nparent\n" || string(key) != "raw-key" {
+	if string(cert) != string(leaf)+"\n"+string(ca.certPEM)+"\n" || string(key) != string(leafKey) {
 		t.Fatalf("got cert %q key %q", cert, key)
 	}
 
@@ -1772,6 +1766,131 @@ func TestReadCertChainRawFields(t *testing.T) {
 	if string(certPEM(emptyRaw)) != "old" || string(keyPEM(emptyRaw)) != "old-key" {
 		t.Fatalf("empty raw fields should fall back: %q %q", certPEM(emptyRaw), keyPEM(emptyRaw))
 	}
+}
+
+// TestReadCertChainRejectsBadChain checks that an upload the gNMI listener
+// could not serve is rejected before it is activated.
+func TestReadCertChainRejectsBadChain(t *testing.T) {
+	ca := newTestCA(t, "ca")
+	otherCA := newTestCA(t, "other-ca")
+	leaf, leafKey := ca.issue(t, "leaf")
+	_, otherKey := ca.issue(t, "other-leaf")
+	chain := func(leaf, key []byte, parents ...[]byte) *certz.CertificateChain {
+		pemCert := func(cert []byte) *certz.Certificate {
+			return &certz.Certificate{
+				Type:            certz.CertificateType_CERTIFICATE_TYPE_X509,
+				Encoding:        certz.CertificateEncoding_CERTIFICATE_ENCODING_PEM,
+				CertificateType: &certz.Certificate_RawCertificate{RawCertificate: cert},
+			}
+		}
+		c := &certz.CertificateChain{Certificate: pemCert(leaf)}
+		c.Certificate.PrivateKeyType = &certz.Certificate_RawPrivateKey{RawPrivateKey: key}
+		tail := c
+		for _, p := range parents {
+			tail.Parent = &certz.CertificateChain{Certificate: pemCert(p)}
+			tail = tail.Parent
+		}
+		return c
+	}
+
+	for _, tc := range []struct {
+		desc  string
+		chain *certz.CertificateChain
+		want  string
+	}{
+		{"key of another certificate", chain(leaf, otherKey, ca.certPEM), "invalid certificate or private key"},
+		{"key that is not PEM", chain(leaf, []byte("key"), ca.certPEM), "invalid certificate or private key"},
+		{"parent that did not sign the leaf", chain(leaf, leafKey, otherCA.certPEM), "is not signed by its parent"},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			cs := &GNSICertzServer{profiles: map[string]*profile{defaultProfile: {ID: defaultProfile}}}
+			_, _, err := cs.readCertChain(defaultProfile, tc.chain)
+			if status.Code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("readCertChain error = %v, want InvalidArgument with %q", err, tc.want)
+			}
+		})
+	}
+
+	cs := &GNSICertzServer{profiles: map[string]*profile{defaultProfile: {ID: defaultProfile}}}
+	if _, _, err := cs.readCertChain(defaultProfile, chain(leaf, leafKey, ca.certPEM)); err != nil {
+		t.Fatalf("readCertChain of a valid chain: %v", err)
+	}
+}
+
+// testCA is a CA that issues test certificates.
+type testCA struct {
+	cert    *x509.Certificate
+	key     *ecdsa.PrivateKey
+	certPEM []byte
+}
+
+func newTestKey(t *testing.T) (*ecdsa.PrivateKey, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+}
+
+// newTestCert creates a certificate for key signed by parent and parentKey,
+// or a self-signed one if parent is nil.
+func newTestCert(t *testing.T, cn string, isCA bool, key *ecdsa.PrivateKey, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, []byte) {
+	t.Helper()
+	serial, err := rand.Int(rand.Reader, big.NewInt(1<<62))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  isCA,
+	}
+	if isCA {
+		tmpl.KeyUsage = x509.KeyUsageCertSign
+	}
+	if parent == nil {
+		parent, parentKey = tmpl, key
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func newTestCA(t *testing.T, cn string) *testCA {
+	t.Helper()
+	key, _ := newTestKey(t)
+	cert, certPEM := newTestCert(t, cn, true, key, nil, nil)
+	return &testCA{cert: cert, key: key, certPEM: certPEM}
+}
+
+// issue returns a certificate signed by the CA and its private key, in PEM.
+func (ca *testCA) issue(t *testing.T, cn string) ([]byte, []byte) {
+	t.Helper()
+	key, keyPEM := newTestKey(t)
+	_, certPEM := newTestCert(t, cn, false, key, ca.cert, ca.key)
+	return certPEM, keyPEM
+}
+
+// newTestLeaf returns a self-signed certificate and its private key, in PEM.
+func newTestLeaf(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	key, keyPEM := newTestKey(t)
+	_, certPEM := newTestCert(t, "leaf", false, key, nil, nil)
+	return certPEM, keyPEM
 }
 
 func TestGetLinkPathsIsolatesCustomProfiles(t *testing.T) {
