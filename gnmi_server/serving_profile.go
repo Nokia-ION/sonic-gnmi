@@ -128,10 +128,9 @@ func unbindProfile(profileID string) {
 // verify clients from ever coming from different profiles, and it means a
 // typo or a half-rotated profile cannot cost operators access to the device.
 //
-// advancedtls asks for the identity certificate and for the trust roots in two
-// separate callbacks, so a rebind landing between them can still fail the one
-// handshake that straddles it; the client simply reconnects. Caching the choice
-// is what keeps that window to the rebind itself instead of every connection.
+// The serving TLS config calls this once per handshake and takes the identity
+// certificate, the trust roots and the CRLs from the result. Only the choice is
+// cached, so CONFIG_DB is read at most once per servingChoiceTTL.
 //
 // NOTE: muPath has to be read-locked when entering this function.
 func servingProfilePaths(cfg *Config) profilePaths {

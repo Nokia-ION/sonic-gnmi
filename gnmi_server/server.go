@@ -470,79 +470,13 @@ func SrvTestConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, e
 	return SrvAdvConfig(cfg)
 }
 
-// SrvAdvConfig returns mTLS server configuration to be used to start gNMI/gNOI server with rotating certificates.
+// SrvAdvConfig returns advancedtls server credentials with rotating
+// certificates. The telemetry server uses SrvRotatingConfig instead: advancedtls
+// does not request a client certificate unless one is required, and cannot
+// take the TLS hardening the server applies.
 func SrvAdvConfig(cfg *Config) ([]grpc.ServerOption, []certprovider.Provider, error) {
-	// 1. Safety Check: Ensure link paths are not empty before OS operations.
-	// This prevents os.Stat("") or os.Symlink("", ...) from crashing.
-	if cfg.CaCertLnk == "" {
-		cfg.CaCertLnk = "/keys/ca_cert.lnk"
-	}
-	if cfg.SrvCertLnk == "" {
-		cfg.SrvCertLnk = "/keys/server_cert.lnk"
-	}
-	if cfg.SrvKeyLnk == "" {
-		cfg.SrvKeyLnk = "/keys/server_key.lnk"
-	}
-	muPath.Lock()
-	defer muPath.Unlock()
-
-	log.V(1).Infof("Setting server credentials using: %v; %v; %v; %v; %v; %v;", cfg.CaCertLnk, cfg.CaCertFile, cfg.SrvCertLnk, cfg.SrvCertFile, cfg.SrvKeyLnk, cfg.SrvKeyFile)
-	// CA Certificate Check. Link the configured CA on start unless a gNSI
-	// Certz rotation is currently in effect (then keep the rotated bundle so
-	// it survives restarts). This lets a changed config CA take effect and
-	// heals stale non-rotation links.
-	if cfg.CaCertFile != "" {
-		if _, err := os.Stat(cfg.CaCertFile); err != nil {
-			return nil, nil, fmt.Errorf("CA certificate file not found: %v", err)
-		}
-		if !symlinkPointsToRotation(cfg.CaCertLnk) {
-			atomicSetCACert(cfg, defaultProfile, cfg.CaCertFile)
-		}
-	} else {
-		log.V(1).Infof("CaCertFile is empty; client certificate verification will be disabled.")
-	}
-	// Server Certificate & Key Check (Mandatory for TLS). Same policy: (re)link
-	// the configured server cert/key on start unless a Certz rotation is in
-	// effect for both links. Certz rotates the pair together, so we treat them
-	// as a unit.
-	// The enrollz oIDevID is served with the TPM key and has no key link.
-	certTarget, _ := os.Readlink(cfg.SrvCertLnk)
-	tpmRotation := tpmTLSEnabled(cfg) && symlinkPointsToRotation(cfg.SrvCertLnk) &&
-		filepath.Base(certTarget) == oIDevIDCertName
-	_, keyErr := os.Stat(cfg.SrvKeyFile)
-	switch {
-	case tpmRotation:
-		if _, err := rmSymlink(cfg.SrvKeyLnk); err != nil {
-			return nil, nil, fmt.Errorf("remove stale server key link: %v", err)
-		}
-		log.V(1).Infof("Serving TPM-backed %s with TPM key 0x%08X", certTarget, cfg.TPMKeyHandle)
-	case !symlinkPointsToRotation(cfg.SrvCertLnk) && tpmTLSEnabled(cfg) && cfg.SrvCertFile != "" &&
-		(cfg.SrvKeyFile == "" || errors.Is(keyErr, os.ErrNotExist)):
-		// No key file: the configured certificate is the IDevID, whose key
-		// is in the TPM.
-		if _, err := os.Stat(cfg.SrvCertFile); err != nil {
-			return nil, nil, fmt.Errorf("server certificate file stat error: %v", err)
-		}
-		if err := atomicSetSrvCertTPMSigner(cfg, cfg.SrvCertFile); err != nil {
-			return nil, nil, err
-		}
-		log.V(1).Infof("Serving %s with TPM key 0x%08X", cfg.SrvCertFile, cfg.TPMKeyHandle)
-	case !symlinkPointsToRotation(cfg.SrvCertLnk) || !symlinkPointsToRotation(cfg.SrvKeyLnk):
-		if cfg.SrvCertFile == "" || cfg.SrvKeyFile == "" {
-			// No configured material to (re)link. Fall back to any existing
-			// valid symlinks; only fail if there is nothing usable to serve.
-			if !isSymlinkValid(cfg.SrvCertLnk) || !isSymlinkValid(cfg.SrvKeyLnk) {
-				return nil, nil, fmt.Errorf("server certificate or key file path is empty")
-			}
-		} else {
-			if _, err := os.Stat(cfg.SrvCertFile); err != nil {
-				return nil, nil, fmt.Errorf("server certificate file stat error: %v", err)
-			}
-			if _, err := os.Stat(cfg.SrvKeyFile); err != nil {
-				return nil, nil, fmt.Errorf("server key file stat error: %v", err)
-			}
-			atomicSetSrvCertKeyPair(cfg, defaultProfile, cfg.SrvCertFile, cfg.SrvKeyFile)
-		}
+	if err := linkServingCerts(cfg); err != nil {
+		return nil, nil, err
 	}
 
 	providers := []certprovider.Provider{}

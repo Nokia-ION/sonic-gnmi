@@ -382,7 +382,7 @@ func setupFlags(fs *flag.FlagSet) (*TelemetryConfig, *gnmi.Config, error) {
 		}
 	}
 	if !*telemetryCfg.Insecure {
-		cfg.GetOptions = gnmi.SrvAdvConfig
+		cfg.GetOptions = gnmi.SrvRotatingConfig
 	}
 	if telemetryCfg.UserAuth.Enabled("cert") {
 		if *telemetryCfg.NoTLS {
@@ -540,7 +540,7 @@ func startGNMIServer(telemetryCfg *TelemetryConfig, cfg *gnmi.Config, serverCont
 				}
 
 				tlsCfg := &tls.Config{
-					ClientAuth:               tls.RequireAndVerifyClientCert,
+					ClientAuth:               tlsClientAuthPolicy(*telemetryCfg.AllowNoClientCert),
 					Certificates:             []tls.Certificate{certificate},
 					MinVersion:               tls.VersionTLS12,
 					SessionTicketsDisabled:   true,
@@ -554,13 +554,6 @@ func startGNMIServer(telemetryCfg *TelemetryConfig, cfg *gnmi.Config, serverCont
 						tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 						tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 					},
-				}
-
-				if *telemetryCfg.AllowNoClientCert {
-					// RequestClientCert will ask client for a certificate but
-					// won't require it to proceed. If certificate is provided,
-					// it will be verified.
-					tlsCfg.ClientAuth = tls.RequestClientCert
 				}
 
 				if *telemetryCfg.CaCert != "" {
@@ -577,13 +570,12 @@ func startGNMIServer(telemetryCfg *TelemetryConfig, cfg *gnmi.Config, serverCont
 
 				tlsOpts = []grpc.ServerOption{grpc.Creds(credentials.NewTLS(tlsCfg))}
 			} else {
-				// Secure path: serve TLS through advancedtls per-connection
-				// callbacks (cfg.GetOptions == SrvAdvConfig) that re-read the
-				// cert/key/CA symlinks on every new handshake. This makes gNSI
-				// Certz rotation hitless: Certz.Rotate flips the symlink and the
-				// next connection is served the new certificate with no restart.
-				// SrvAdvConfig also bootstraps the symlinks from the configured
-				// cert/key/CA on first start.
+				// Secure path: cfg.GetOptions (SrvRotatingConfig) re-reads the
+				// cert/key/CA symlinks and the CRLs on every new handshake. This
+				// makes gNSI Certz rotation hitless: Certz.Rotate flips the
+				// symlink and the next connection is served the new certificate
+				// with no restart. SrvRotatingConfig also bootstraps the symlinks
+				// from the configured cert/key/CA on first start.
 				opts, _, err := cfg.GetOptions(cfg)
 				if err != nil {
 					log.Errorf("could not set up server TLS credentials: %s", err)
